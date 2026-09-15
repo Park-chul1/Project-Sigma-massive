@@ -1,65 +1,32 @@
-# Project Sigma — Cross-Sectional Factor Research Pipeline (V1)
+# Project Sigma — Cross-Sectional Factor Model Pipeline
 
-A research prototype for building, estimating, and backtesting a daily cross-sectional equity factor model.
+Project Sigma is a daily cross-sectional equity factor research pipeline built with Massive/Polygon-compatible market and fundamental data.
 
-This repository is the **first version of Project Sigma**. It was built to understand the full research pipeline end-to-end: market/fundamental data ingestion, factor construction, cross-sectional regression, factor-return forecasting, portfolio construction, backtesting, and paper execution.
-
-The most important outcome of V1 was not the backtest performance itself, but identifying how strongly the result depends on **data quality, point-in-time correctness, survivorship bias, delisting treatment, and market-regime stability**.
-
-Because those issues are not fully resolved in the original Massive/Polygon-based dataset, historical performance from this repository is **not treated as reliable evidence of an investable strategy**. Current work is focused on rebuilding the research dataset from WRDS CRSP/Compustat before evaluating the model again.
-
-## Research Motivation
-
-The initial question was simple:
-
-> Can a set of cross-sectional equity factors be combined into a systematic daily ranking and portfolio construction framework?
-
-V1 implements that question as a complete pipeline and then uses the resulting backtests as a diagnostic tool. During development, several problems became more important than improving the model itself:
-
-- Is the historical stock universe genuinely point-in-time?
-- Are delisted securities and delisting returns handled correctly?
-- Are fundamentals available only from the date they could actually have been known?
-- Are unusually high backtest results caused by the model, or by the dataset and simulation assumptions?
-- Do factor relationships remain stable when the market regime changes?
-- How sensitive are results to turnover, slippage, execution timing, and factor specification?
-
-These questions now define the direction of Project Sigma V2.
-
-## Current Status
-
-**V1 — this repository**
-
-- Massive/Polygon-compatible market and fundamental data
-- Daily cross-sectional factor exposures
-- Ridge-regularized linear regression for factor-return estimation
-- Rolling / EWMA factor-return forecasts
-- Long-short portfolio construction
-- Close-to-next-open backtesting
-- Transaction-cost and slippage assumptions
-- Residual, turnover, exposure, and execution diagnostics
-- IBKR paper-execution tooling
-
-**V2 — current work**
-
-The dataset is being rebuilt using **WRDS CRSP and Compustat** with a stronger emphasis on research validity:
+The project constructs factor exposures, estimates daily factor returns with cross-sectional regression, forecasts factor returns from recent history, converts them into stock-level scores, and evaluates long/short portfolios through backtesting and paper execution.
 
 ```text
-RAW
-  ↓
-NORMALIZED
-  ↓
-POINT-IN-TIME / DERIVED
-  ↓
-FACTOR
-  ↓
-BACKTEST
+Market / Fundamental Data
+        ↓
+Factor Construction
+        ↓
+Cross-sectional Preprocessing
+        ↓
+Exposure Matrix X[T, N, K]
+        ↓
+Factor Return Estimation
+        ↓
+Factor Return Forecast
+        ↓
+Stock Scores
+        ↓
+Portfolio Construction
+        ↓
+Backtest / Diagnostics / Paper Execution
 ```
 
-The goal is to make historical universe membership, identifiers, delistings, corporate events, fundamental availability, and look-ahead controls explicit before evaluating strategy performance.
+## Mathematical Framework
 
-## Model Overview
-
-For each trading date `t`, the cross-sectional return model is
+For each trading date `t`, stock returns are modeled as
 
 ```text
 r_t = X_t f_t + ε_t
@@ -67,245 +34,306 @@ r_t = X_t f_t + ε_t
 
 where
 
-- `r_t ∈ R^N` — forward returns across stocks
-- `X_t ∈ R^(N×K)` — cross-sectional factor exposure matrix
-- `f_t ∈ R^K` — estimated factor returns
-- `ε_t` — residual returns
+- `r_t ∈ R^N` : forward returns of N stocks
+- `X_t ∈ R^(N×K)` : factor exposure matrix
+- `f_t ∈ R^K` : factor returns
+- `ε_t ∈ R^N` : residual returns
 
-The pipeline is organized as:
+The model can be interpreted as a linear-algebra projection problem.
+
+Ordinary least squares solves
 
 ```text
-Market + Fundamental Data
-          ↓
-Raw Factors
-          ↓
-Point-in-time availability rules
-          ↓
-Cross-sectional winsorization / z-score
-          ↓
-Exposure Matrix X[T, N, K]
-          ↓
-Cross-sectional Ridge Regression
-          ↓
-Historical Factor Returns f[T, K]
-          ↓
-Rolling / EWMA Forecast
-          ↓
-Stock Scores
-          ↓
-Long / Short Portfolio
-          ↓
-Backtest + Diagnostics
+f_t = argmin_f ||r_t - X_t f||²
 ```
 
-## Factor-Return Estimation
+and, when `X_t'X_t` is invertible,
 
-V1 estimates factor returns cross-sectionally for each date.
+```text
+f_t = (X_t'X_t)^(-1) X_t'r_t
+```
 
-### Ridge regression
+The fitted component
+
+```text
+X_t f_t
+```
+
+is the projection of the return vector onto the column space generated by the factor exposures. The residual is
+
+```text
+ε_t = r_t - X_t f_t
+```
+
+and is orthogonal to the factor space under the ordinary least-squares formulation.
+
+In practice, factor exposures can be strongly correlated and the design matrix can become ill-conditioned. The project therefore uses ridge regression for more stable estimation.
+
+## Ridge Regression
+
+Daily factor returns are estimated using
 
 ```text
 f_t = argmin_f ||r_t - X_t f||² + λ||f||²
 ```
 
-Equivalent normal-equation form:
+with solution
 
 ```text
 f_t = (X_t'X_t + λI)^(-1) X_t'r_t
 ```
 
-The implementation supports both fixed ridge regularization and generalized cross-validation (GCV) for selecting `λ`. The default numerical path can solve the augmented least-squares problem with QR rather than explicitly inverting `X'X`.
+Ridge regularization reduces sensitivity to multicollinearity and small singular values of the exposure matrix.
 
-This was added because factor exposures can be highly correlated and the daily cross-sectional design matrix can become ill-conditioned.
+The implementation supports:
 
-## Factor Exposure Processing
+- fixed ridge parameter `λ`
+- generalized cross-validation (GCV) for selecting `λ`
+- QR-based solution of the augmented least-squares system
+- normal-equation solving as an alternative path
+- per-date diagnostics for selected ridge values and observation counts
 
-For each date and factor:
+The QR formulation solves
 
-1. Apply the available universe / tradability mask.
-2. Preserve natural missing values during raw factor construction.
-3. Winsorize the cross-section at configurable quantiles.
-4. Z-score the factor cross-sectionally.
-5. Drop factors with insufficient finite coverage.
-6. Remove near-duplicate factors above a configurable correlation threshold.
-7. Optionally map remaining missing standardized exposures to zero, interpreted as neutral exposure.
+```text
+[ X_t       ] f_t ≈ [ r_t ]
+[ sqrt(λ) I ]       [  0  ]
+```
 
-The resulting tensor has shape:
+as an augmented least-squares problem instead of relying on explicit inversion of `X_t'X_t`.
+
+## Factor Exposure Matrix
+
+For each date, the project constructs
+
+```text
+X_t ∈ R^(N×K)
+```
+
+and stores the full panel as
 
 ```text
 X[T, N, K]
 ```
 
-with trading dates `T`, securities `N`, and factors `K`.
+where
+
+- `T` = trading dates
+- `N` = securities
+- `K` = factors
+
+Each factor is processed cross-sectionally:
+
+1. Apply the tradable/universe mask.
+2. Preserve natural missing values from unavailable observations.
+3. Winsorize extreme values.
+4. Z-score each factor across stocks for that date.
+5. Remove factors with insufficient coverage.
+6. Remove near-duplicate factors above a configurable correlation threshold.
+7. Optionally fill remaining standardized missing exposures with `0`, interpreted as neutral exposure.
+
+Cross-sectional standardization is
+
+```text
+z_i = (x_i - μ_t) / σ_t
+```
+
+so coefficients are estimated on comparable exposure scales.
 
 ## Factor Set
 
-The implemented factor library includes price/volume and fundamental signals.
+The current factor library contains price/volume and fundamental factors.
 
-### Price / volume examples
+### Price / Volume
 
-- Momentum
-- Realized volatility
+- momentum
+- realized volatility
 - Parkinson volatility
-- Intraday / overnight return
-- Distance from 52-week range
-- Liquidity
-- Amihud-style illiquidity proxy
-- Return skewness / kurtosis
-- Volume momentum
+- intraday return
+- overnight return
+- 52-week range distance
+- liquidity
+- Amihud-style illiquidity
+- skewness
+- kurtosis
+- volume momentum
 
-### Fundamental examples
+### Fundamental
 
 **Valuation**
 
-- Earnings yield
-- Book-to-market
-- Sales-to-price
-- Cash-flow-to-price
-- Free-cash-flow yield
+- earnings yield
+- book-to-market
+- sales-to-price
+- cash-flow-to-price
+- free-cash-flow yield
+- enterprise-value based ratios
 
-**Profitability / quality**
+**Profitability / Quality**
 
 - ROE
 - ROA
-- Gross margin
-- Operating margin
-- Net margin
-- Asset turnover
+- gross margin
+- operating margin
+- net margin
+- asset turnover
 
-**Balance sheet / growth**
+**Balance Sheet / Growth**
 
-- Debt-to-equity
-- Current ratio
-- Cash-to-assets
-- Revenue growth
-- Net-income growth
+- debt-to-equity
+- current ratio
+- cash-to-assets
+- revenue growth
+- net-income growth
 
-Not every factor is available for every security/date. Coverage is tracked explicitly during preprocessing.
+## Factor Return Forecasting
 
-## Forecasting and Portfolio Construction
-
-Historical daily factor returns can be converted into a next-period estimate using:
+After estimating historical factor returns `f_t`, the current implementation forecasts the next-period factor-return vector using:
 
 - latest observation
-- rolling historical mean
+- rolling mean
 - exponentially weighted moving average (EWMA)
 
-The score for stock `n` is approximately
+The predicted factor-return vector is combined with current exposures:
 
 ```text
-alpha[t,n] = X[t,n,:] @ f_pred[t+1,:]
+alpha_t = X_t f_hat_(t+1)
 ```
 
-Stocks are ranked cross-sectionally and used to form configurable long/short quantile portfolios.
-
-The current forecasting methods are deliberately simple. A major open question is whether factor-return dynamics should be conditioned on **market regimes** rather than assuming a stable relationship through time.
-
-## Backtesting Convention
-
-The canonical daily workflow is:
+For stock `n`,
 
 ```text
-close[t] information
-    ↓
-after-close signal generation
-    ↓
-target portfolio saved
-    ↓
-next trading day open execution
+alpha[t,n] = X[t,n,:] @ f_hat[t+1,:]
 ```
 
-Signals are not recomputed using future or intraday information after the signal date.
+The resulting cross-sectional scores are used for ranking and portfolio construction.
 
-The backtesting code tracks items such as:
+## Regime Detection — Planned Direction
 
-- portfolio return
+The current forecasting layer applies the same basic forecasting rule through time. A planned extension is to explicitly detect changes in market regime and condition factor forecasts on the current state.
+
+The intended structure is
+
+```text
+Market / Factor State Variables
+        ↓
+Regime Detection
+        ↓
+Regime-conditioned Factor Dynamics
+        ↓
+Factor Return Forecast
+        ↓
+Portfolio Weights
+```
+
+Potential regime variables include:
+
+- market volatility
+- cross-sectional return dispersion
+- correlation structure
+- liquidity conditions
+- trend / momentum state
+- factor-return covariance
+
+The main research question is whether factor expected returns and covariance structures differ enough across regimes to justify regime-conditioned forecasts or portfolio weights.
+
+Possible approaches include clustering, hidden-state models, change-point detection, and state-space models.
+
+## Portfolio Construction
+
+Stocks are ranked using predicted alpha scores and converted into configurable long/short quantile portfolios.
+
+Typical construction:
+
+```text
+Long  : top q% of stocks
+Short : bottom q% of stocks
+```
+
+Portfolio controls include:
+
 - gross exposure
+- maximum position size
+- minimum number of names per side
+- tradability filters
 - turnover
 - transaction-cost assumptions
 - slippage assumptions
-- return coverage
+- minimum cost-adjusted alpha threshold
+
+## Backtesting Convention
+
+The daily workflow is
+
+```text
+close[t] data
+    ↓
+after-close factor estimation / signal generation
+    ↓
+save target portfolio
+    ↓
+execute at next trading-day open
+```
+
+Signal generation and execution are separated so the portfolio is not recomputed using information after the signal date.
+
+The backtest tracks:
+
+- daily portfolio return
+- cumulative return
+- Sharpe ratio
+- maximum drawdown
+- turnover
+- gross exposure
 - long / short counts
-- residual diagnostics
-- factor contributions
+- return coverage
+- transaction-cost and slippage estimates
 
-## Data Integrity and Bias Controls
+## Residual and Numerical Diagnostics
 
-V1 contains several controls intended to reduce common backtesting errors, but they should **not be interpreted as proving the dataset is fully point-in-time or survivorship-free**.
+The project includes diagnostics for both the statistical model and numerical behavior.
 
-### Fundamental availability
+Examples:
 
-Financial statement rows use their filing date when available. If a filing date is unavailable, V1 can fall back to an assumed lag from the reporting-period end date.
-
-Fundamental values are then forward-filled only after their assumed availability date.
-
-This reduces obvious look-ahead leakage, but an assumed reporting lag is still an approximation and is one reason the dataset is being rebuilt.
-
-### Universe / survivorship handling
-
-The pipeline can request inactive as well as active ticker metadata and uses a date-by-security tradability mask during preprocessing and regression.
-
-However, this does **not** guarantee a historically exact exchange-membership universe. Delisting-return handling and vendor-backed historical security membership are incomplete in V1.
-
-### Return and execution timing
-
-Forward returns and signal dates are separated explicitly, and the close-to-next-open workflow is tested to prevent accidental same-period execution.
-
-## Why the Original Backtest Is Not Presented as a Result
-
-Earlier versions of this repository produced unusually strong risk-adjusted performance in historical backtests.
-
-Rather than treating those numbers as evidence of alpha, V1 now treats them as a **validation warning**. The result may be affected by unresolved issues including:
-
-- incomplete historical universe reconstruction
-- survivorship effects
-- incomplete delisting treatment
-- approximate point-in-time fundamental availability
-- corporate-action assumptions
-- model-selection and specification risk
-- simplified execution and transaction-cost assumptions
-- changing factor behavior across market regimes
-
-For that reason, headline Sharpe or return numbers are intentionally not presented here as strategy performance.
-
-The strategy will be evaluated again after the WRDS-based dataset and validation pipeline are complete.
-
-## Diagnostics
-
-The project includes diagnostics for inspecting whether the regression and backtest behave as expected.
-
-Examples include:
-
-- selected ridge parameter by date
-- number of securities entering each regression
+- number of securities used in each regression
+- selected ridge parameter
 - factor coverage
-- high-correlation factor removal
+- correlated-factor removal
 - residual heatmaps
 - daily cross-sectional MSE
-- large residual events
-- return coverage
-- turnover
-- exposure
-- cost-adjusted alpha thresholds
+- largest residual events
+- turnover and exposure
+- execution-quality metrics
 
-Residual diagnostics can be generated with:
+Residuals are defined as
 
-```bash
-python scripts/plot_residual_heatmap.py \
-  --input-dir data/nasdaq_full \
-  --clip-percentile 99.5 \
-  --sort-tickers-by coverage \
-  --top-tickers 50 \
-  --top-events 100
+```text
+ε_t = r_t - X_t f_t
 ```
+
+and are used to inspect dates or securities where the factor model explains returns poorly.
+
+## Data Note
+
+The project uses Massive/Polygon-compatible market and financial-statement data and includes controls for inactive securities, tradability, and point-in-time-style fundamental availability.
+
+The historical dataset may not represent a perfectly reconstructed point-in-time universe. Historical membership, delisting treatment, filing availability, and corporate actions can affect backtest results, so performance statistics should be interpreted with those limitations in mind.
 
 ## Paper Execution
 
-V1 also contains an IBKR paper-execution layer. This exists mainly to test whether a research signal can be translated into a reproducible order workflow.
+The repository contains an IBKR paper-execution layer for testing the path from model output to broker orders.
 
-The daily execution path loads a saved after-close order plan and submits or monitors orders on the next trading session. Legacy intraday signal recomputation is disabled by default.
+```text
+After-close signal
+    ↓
+Saved order plan
+    ↓
+Next-session submission
+    ↓
+Fill / exposure / execution monitoring
+```
 
-Paper-execution functionality should be considered an engineering prototype rather than evidence that the research model is ready for live capital.
+Intraday monitoring is separated from alpha recomputation so delayed intraday data does not change the original daily signal.
 
 ## Installation
 
@@ -315,23 +343,15 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Set a Massive-compatible API key:
+Set the Massive API key:
 
 ```bash
 export MASSIVE_API_KEY="your_key"
 ```
 
-## Minimal Research Run
+## Example Run
 
-```bash
-python scripts/run_clean_pipeline.py \
-  --start 2024-01-01 \
-  --end 2024-03-31 \
-  --max-tickers 30 \
-  --out-dir data/test_clean
-```
-
-A larger run can use the broader historical ticker set:
+Build the pipeline:
 
 ```bash
 python scripts/run_clean_pipeline.py \
@@ -341,7 +361,7 @@ python scripts/run_clean_pipeline.py \
   --out-dir data/nasdaq_full
 ```
 
-Run the basic factor backtest:
+Run a factor backtest:
 
 ```bash
 python scripts/run_backtest.py \
@@ -352,7 +372,7 @@ python scripts/run_backtest.py \
   --ewma-halflife 20
 ```
 
-Run the close-to-next-open simulation:
+Run the close-to-next-open backtest:
 
 ```bash
 python scripts/run_close_to_next_open_backtest.py \
@@ -368,11 +388,11 @@ factor_returns.npy            # T x K estimated factor returns
 factor_names.csv              # factor names
 tickers.csv                   # securities
 dates.csv                     # trading dates
-tradable_mask.npy             # T x N universe/tradability mask
+tradable_mask.npy             # T x N tradability mask
 factor_diagnostics_*.csv      # preprocessing diagnostics
-financials_flat.parquet       # flattened filing rows
-financials_ttm.parquet        # point-in-time-style TTM fields
-pipeline_summary.json         # run metadata and parameters
+financials_flat.parquet       # flattened financial rows
+financials_ttm.parquet        # TTM financial fields
+pipeline_summary.json         # run metadata
 ```
 
 ## Tests
@@ -381,14 +401,14 @@ pipeline_summary.json         # run metadata and parameters
 pytest -q
 ```
 
-The test suite covers core components including:
+Tests cover:
 
-- factor preprocessing
-- ridge estimation and diagnostics
-- dynamic factor construction
-- fundamental-factor construction
+- preprocessing
+- factor construction
+- ridge estimation
+- ridge diagnostics
 - close-to-next-open timing
-- backtest workflow
+- backtesting
 - report generation
 - paper-execution logic
 
@@ -415,19 +435,7 @@ tests/
 tools/
 ```
 
-## Main Lessons from V1
-
-Project Sigma V1 started as a modeling project, but the main lesson was that a convincing quantitative result depends at least as much on **dataset construction and validation** as on the forecasting model.
-
-The current priority is therefore not to add a more complicated model to an uncertain dataset. It is to establish a research dataset whose historical information set can be defended, then re-test simple models before increasing complexity.
-
 ## References
 
 - Fama, E. F., & MacBeth, J. D. (1973). *Risk, Return, and Equilibrium: Empirical Tests*. Journal of Political Economy, 81(3), 607–636.
 - Hastie, T., Tibshirani, R., & Friedman, J. (2009). *The Elements of Statistical Learning*. Springer.
-- Blitz, D., Hanauer, M. X., & Vidojevic, M. (2019). *The Idiosyncratic Momentum Anomaly*. International Review of Economics & Finance.
-
----
-
-**Status:** V1 research prototype / validation stage.  
-**Current direction:** WRDS CRSP + Compustat point-in-time dataset reconstruction and backtest validation.
