@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from live.broker import IBKRPaperBroker
 from live.config import LiveConfig
+from factor_pipeline.universe import validate_wrds_source
 from live.execution import generate_orders
 from live.risk import apply_risk_checks
 
@@ -20,7 +22,6 @@ class PaperSubmitConfig:
     account: str | None = None
     dry_run: bool = False
     max_orders: int | None = None
-    use_live_prices: bool = False
     transaction_cost_bps: float = 1.0
     slippage_bps: float = 2.0
     min_net_alpha_after_cost_bps: float = 5.0
@@ -34,12 +35,15 @@ def load_target_weights(report_dir: Path, cfg: PaperSubmitConfig | None = None) 
     path = report_dir / "target_positions.csv"
     if not path.exists():
         raise FileNotFoundError(f"Missing target positions file: {path}")
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, dtype={"ticker": str})
+    validate_wrds_source(df, "target portfolio report")
     required = {"ticker", "target_weight"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"{path} missing required columns: {sorted(missing)}")
     df = df.assign(target_weight=pd.to_numeric(df["target_weight"], errors="coerce"))
+    if df["ticker"].isna().any() or df["ticker"].duplicated().any() or not np.isfinite(df["target_weight"]).all():
+        raise ValueError("Target portfolio report requires unique security IDs and finite weights")
     if cfg is not None and "alpha_score" in df.columns:
         alpha = pd.to_numeric(df["alpha_score"], errors="coerce")
         threshold = (cfg.transaction_cost_bps + cfg.slippage_bps + cfg.min_net_alpha_after_cost_bps) / 10_000.0
@@ -68,38 +72,36 @@ def _apply_min_price_to_targets(target_weights: pd.Series, prices: pd.Series, mi
     return target_weights.loc[~too_low].sort_index()
 
 
-def _fallback_prices_from_order_plan(report_dir: Path) -> pd.Series:
-    frames = []
-    for name in ["alpha_rankings.csv", "orders.csv"]:
-        path = report_dir / name
-        if not path.exists():
-            continue
-        df = pd.read_csv(path)
-        if "ticker" not in df.columns:
-            continue
-        if "signal_price" in df.columns:
-            prices = pd.to_numeric(df["signal_price"], errors="coerce")
-        elif "execution_price" in df.columns:
-            prices = pd.to_numeric(df["execution_price"], errors="coerce")
-        else:
-            continue
-        frames.append(pd.Series(prices.to_numpy(), index=df["ticker"].astype(str), dtype=float))
-    if not frames:
-        return pd.Series(dtype=float)
-    out = pd.concat(frames)
-    return out[out.gt(0)].groupby(level=0).last()
+def _report_execution_inputs(report_dir: Path, model_ids: list[str]) -> tuple[pd.Series, pd.Series]:
+    path = report_dir / "alpha_rankings.csv"
+    frame = pd.read_csv(path, dtype={"ticker": str, "symbol": str})
+    validate_wrds_source(frame, "daily order report")
+    required = {"ticker", "symbol", "raw_signal_price"}
+    if not required.issubset(frame.columns):
+        raise ValueError("Regenerate the WRDS daily report with broker symbols and raw_signal_price")
+    selected = frame[frame["ticker"].isin(model_ids)].copy()
+    if selected["ticker"].duplicated().any() or selected["symbol"].duplicated().any():
+        raise ValueError("Ambiguous Compustat-to-broker symbol mapping in daily report")
+    mapping = selected.set_index("ticker")["symbol"].reindex(model_ids)
+    if mapping.isna().any() or mapping.str.strip().eq("").any():
+        raise ValueError("Missing broker symbols in WRDS daily report; refusing to submit security IDs")
+    prices = pd.to_numeric(frame["raw_signal_price"], errors="coerce")
+    valid = frame["symbol"].notna() & np.isfinite(prices) & prices.gt(0)
+    price_frame = pd.DataFrame({"symbol": frame.loc[valid, "symbol"], "price": prices[valid]})
+    duplicated = price_frame["symbol"].duplicated(keep=False)
+    price_frame = price_frame.loc[~duplicated]
+    return mapping, price_frame.set_index("symbol")["price"]
 
 
 def _live_config(cfg: PaperSubmitConfig) -> LiveConfig:
     base = LiveConfig(
-        DATA_PROVIDER="massive",
+        DATA_PROVIDER="wrds",
         BROKER="ibkr_paper",
         PAPER_TRADING=True,
         ENABLE_REAL_TRADING=False,
         IBKR_HOST=cfg.host,
         IBKR_PORT=cfg.port,
         IBKR_BROKER_CLIENT_ID=cfg.client_id,
-        IBKR_DATA_CLIENT_ID=cfg.client_id,
         IBKR_ACCOUNT=cfg.account,
         DRY_RUN=cfg.dry_run,
         COST_BPS=cfg.transaction_cost_bps,
@@ -113,9 +115,8 @@ def _live_config(cfg: PaperSubmitConfig) -> LiveConfig:
 def submit_report_to_ibkr_paper(report_dir: str | Path, cfg: PaperSubmitConfig) -> pd.DataFrame:
     report_path = Path(report_dir)
     target_weights = load_target_weights(report_path, cfg)
-    if target_weights.empty:
-        raise RuntimeError(f"No non-zero target weights found in {report_path / 'target_positions.csv'}")
-
+    mapping, report_prices = _report_execution_inputs(report_path, target_weights.index.tolist())
+    target_weights = target_weights.rename(index=mapping.to_dict())
     live_config = _live_config(cfg)
     broker = IBKRPaperBroker(live_config)
     rows: list[dict[str, Any]] = []
@@ -124,11 +125,9 @@ def submit_report_to_ibkr_paper(report_dir: str | Path, cfg: PaperSubmitConfig) 
         equity = float(account.get("equity", live_config.PAPER_STARTING_EQUITY))
         current_positions = broker.get_positions()
         symbols = sorted(set(target_weights.index.astype(str)) | set(current_positions.index.astype(str)))
-        fallback = _fallback_prices_from_order_plan(report_path)
-        if cfg.use_live_prices:
-            prices = broker.get_prices(symbols).combine_first(fallback)
-        else:
-            prices = fallback.reindex(symbols)
+        prices = report_prices.reindex(symbols)
+        if prices.isna().any():
+            raise ValueError(f"Missing unadjusted WRDS prices for broker symbols: {prices[prices.isna()].index.tolist()}")
         target_weights = _apply_min_price_to_targets(target_weights, prices, cfg.min_price)
 
         orders = generate_orders(current_positions, target_weights, prices, equity, live_config)
@@ -194,6 +193,8 @@ def submit_report_to_ibkr_paper(report_dir: str | Path, cfg: PaperSubmitConfig) 
             broker.ib.disconnect()
 
     out = pd.DataFrame(rows)
+    if out.empty:
+        out = pd.DataFrame(columns=["ticker", "side", "quantity", "limit_price", "order_status", "order_id", "error"])
     out_path = report_path / "paper_order_results.csv"
     out.to_csv(out_path, index=False)
     return out

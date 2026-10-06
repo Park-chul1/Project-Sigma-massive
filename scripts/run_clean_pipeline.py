@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import sys
 
@@ -12,34 +11,28 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from factor_pipeline.config import get_api_key
-from factor_pipeline.massive_client import MassiveClient, download_nasdaq_tickers, download_grouped_daily_range, download_financials
-from factor_pipeline.panel import bars_long_to_panel, build_tradable_mask, compute_forward_returns
+from factor_pipeline.wrds_client import (
+    WRDSClient, download_nasdaq_membership, download_security_metadata,
+    download_daily_bars, download_fundamentals,
+)
+from factor_pipeline.universe import (
+    build_nasdaq_membership_mask, exclude_bottom_market_cap, validate_wrds_source,
+)
+from factor_pipeline.panel import bars_long_to_panel, build_tradable_mask, compute_forward_returns, delisting_dates
 from factor_pipeline.price_volume_factors import build_price_volume_factors
-from factor_pipeline.fundamental_factors import flatten_financials, build_ttm_financials, fundamentals_to_daily, build_fundamental_factors
+from factor_pipeline.fundamental_factors import build_ttm_financials, fundamentals_to_daily, build_fundamental_factors
 from factor_pipeline.preprocess import apply_universe_mask, build_exposure_tensor
 from factor_pipeline.estimation import estimate_factor_returns
 from factor_pipeline.diagnostics import array_summary, factor_diagnostics, save_json
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Clean Massive NASDAQ price+fundamental factor pipeline")
+    p = argparse.ArgumentParser(description="Compustat/WRDS historical NASDAQ price+fundamental factor pipeline")
     p.add_argument("--start", default="2019-01-01")
     p.add_argument("--end", default="2024-12-31")
-    p.add_argument("--exchange", default="XNAS")
-    p.add_argument("--ticker-status", default="all", choices=["all", "active", "inactive"],
-                   help="all includes inactive metadata when available; active reproduces active-only runs")
-    p.add_argument("--max-tickers", type=int, default=None)
-    p.add_argument("--universe-rank-by", default="dollar_volume", choices=["ticker", "dollar_volume"],
-                   help="ticker = alphabetical; dollar_volume = top names by median close*volume")
-    p.add_argument("--universe-rank-window-days", type=int, default=126,
-                   help="Use the first or last N trading days in the requested range to rank tickers by dollar volume")
-    p.add_argument("--universe-rank-anchor", default="end", choices=["start", "end"],
-                   help="Choose whether dollar-volume ranking is anchored at the range start or end")
-    p.add_argument("--out-dir", default="data/processed_clean")
-    p.add_argument("--cache-dir", default="data/cache_clean")
-    p.add_argument("--api-cache-dir", default=None,
-                   help="Raw API response cache directory; defaults to <cache-dir>/api_responses")
+    p.add_argument("--wrds-username", default=None, help="WRDS username; defaults to WRDS_USERNAME")
+    p.add_argument("--out-dir", default="data/processed_wrds")
+    p.add_argument("--cache-dir", default="data/cache_wrds")
     p.add_argument("--min-names", type=int, default=30)
     p.add_argument("--ridge", default="1e-4",
                    help="Fixed ridge lambda, or 'auto' to select lambda date-by-date with GCV")
@@ -49,21 +42,17 @@ def parse_args():
                    help="qr solves the augmented ridge least-squares system")
     p.add_argument("--estimation-workers", type=int, default=1,
                    help="Parallel worker threads for date-by-date factor return estimation")
-    p.add_argument("--horizon", type=int, default=1)
+    p.add_argument("--horizon", type=int, default=1, choices=[1],
+                   help="Daily factor forecasts require a one-session return horizon")
     p.add_argument(
         "--max-abs-forward-return",
         type=float,
         default=1.0,
         help="Drop forward returns whose absolute value exceeds this threshold; use <=0 to disable",
     )
-    p.add_argument("--financial-timeframe", default="quarterly", choices=["ttm", "quarterly", "annual"],
-                   help="quarterly builds historical point-in-time TTM flows; ttm keeps vendor TTM rows")
-    p.add_argument("--financial-limit", type=int, default=100)
-    p.add_argument("--financial-workers", type=int, default=1,
-                   help="Parallel workers for per-ticker financial downloads")
     p.add_argument("--financial-lookback-days", type=int, default=550,
                    help="Extra report-period history before --start used to seed quarterly TTM values")
-    p.add_argument("--financial-lag-days", type=int, default=60, help="Used only when filing_date is missing")
+    p.add_argument("--financial-lag-days", type=int, default=60, help="Availability lag when Compustat rdq is missing")
     p.add_argument("--ttm-min-quarters", type=int, default=4,
                    help="Minimum quarterly rows required to build a TTM flow value")
     p.add_argument("--min-factor-coverage", type=float, default=0.02, help="Drop factors with lower processed finite coverage")
@@ -72,51 +61,13 @@ def parse_args():
     p.add_argument("--corr-min-overlap", type=int, default=100,
                    help="Minimum finite pair observations required before applying the factor correlation filter")
     p.add_argument("--no-fill-missing-exposures", action="store_true", help="Keep NaNs in X after preprocessing instead of neutral 0 fill")
-    p.add_argument("--sleep", type=float, default=0.15)
     p.add_argument("--no-cache", action="store_true", help="Disable parquet dataset caches")
-    p.add_argument("--no-api-cache", action="store_true", help="Disable raw API response cache")
     p.add_argument("--run-diagnostics", action="store_true", help="Run post-pipeline ridge diagnostics")
     p.add_argument("--diagnostics-lambdas", default="0,1e-8,1e-6,1e-4,1e-2,1e-1",
                    help="Comma-separated lambda values for diagnostics")
     p.add_argument("--diagnostics-output-dir", default=None,
                    help="Output directory for diagnostics. Default: <out-dir>/diagnostics")
     return p.parse_args()
-
-def ticker_status_to_active(status: str) -> bool | None:
-    return {"all": None, "active": True, "inactive": False}[status]
-
-
-def download_tickers_for_status(client: MassiveClient, exchange: str, status: str) -> pd.DataFrame:
-    if status != "all":
-        return download_nasdaq_tickers(
-            client,
-            exchange=exchange,
-            active=ticker_status_to_active(status),
-        )
-
-    frames = [
-        download_nasdaq_tickers(client, exchange=exchange, active=True),
-        download_nasdaq_tickers(client, exchange=exchange, active=False),
-    ]
-    frames = [df for df in frames if not df.empty]
-    if not frames:
-        return pd.DataFrame()
-    return (
-        pd.concat(frames, ignore_index=True)
-        .drop_duplicates("ticker", keep="first")
-        .sort_values("ticker")
-        .reset_index(drop=True)
-    )
-
-
-def read_or_build(path: Path, use_cache: bool, builder):
-    if use_cache and path.exists():
-        return pd.read_parquet(path)
-    df = builder()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False)
-    return df
-
 
 def parse_ridge(value: str) -> float | str:
     return "auto" if str(value).lower() == "auto" else float(value)
@@ -130,118 +81,69 @@ def parse_ridge_grid(value: str | None) -> list[float] | None:
 
 def main():
     args = parse_args()
-    out_dir = Path(args.out_dir); cache_dir = Path(args.cache_dir)
-    out_dir.mkdir(parents=True, exist_ok=True); cache_dir.mkdir(parents=True, exist_ok=True)
-    use_cache = not args.no_cache
-    api_cache_dir = Path(args.api_cache_dir) if args.api_cache_dir else cache_dir
-    api_cache_namespace = "" if args.api_cache_dir else "api_responses"
-    api_cache_display = api_cache_dir if not api_cache_namespace else api_cache_dir / api_cache_namespace
-    client = MassiveClient(
-        get_api_key(),
-        sleep_sec=args.sleep,
-        cache_dir=api_cache_dir,
-        use_cache=not args.no_api_cache,
-        cache_namespace=api_cache_namespace,
-    )
-
-    tickers_path = cache_dir / f"tickers_{args.exchange}_{args.ticker_status}.parquet"
-    tickers_df = read_or_build(
-        tickers_path,
-        use_cache,
-        lambda: download_tickers_for_status(client, args.exchange, args.ticker_status),
-    )
-    candidate_tickers = tickers_df["ticker"].dropna().astype(str).sort_values().tolist()
-
-    bars_path = cache_dir / f"grouped_daily_{args.start}_{args.end}.parquet"
-    bars = read_or_build(bars_path, use_cache, lambda: download_grouped_daily_range(client, args.start, args.end))
-    bars = bars[bars["ticker"].isin(candidate_tickers)].copy()
-
-    if args.max_tickers and args.universe_rank_by == "dollar_volume":
-        rank_bars = bars.copy()
-        rank_bars["date"] = pd.to_datetime(rank_bars["date"]).dt.normalize()
-        rank_dates = sorted(rank_bars["date"].dropna().unique())
-        if args.universe_rank_window_days and len(rank_dates) > args.universe_rank_window_days:
-            if args.universe_rank_anchor == "start":
-                rank_dates = rank_dates[: args.universe_rank_window_days]
-            else:
-                rank_dates = rank_dates[-args.universe_rank_window_days:]
-            rank_bars = rank_bars[rank_bars["date"].isin(rank_dates)].copy()
-
-        rank_bars["dollar_volume"] = rank_bars["close"].astype(float) * rank_bars["volume"].astype(float)
-        ranked = (
-            rank_bars.groupby("ticker")["dollar_volume"]
-            .median()
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna()
-            .sort_values(ascending=False)
-        )
-        tickers = ranked.head(args.max_tickers).index.astype(str).tolist()
-    else:
-        tickers = candidate_tickers
-        if args.max_tickers:
-            tickers = tickers[: args.max_tickers]
-
-    tickers_df = tickers_df[tickers_df["ticker"].isin(tickers)].copy()
-    bars = bars[bars["ticker"].isin(tickers)].copy()
-    panel = bars_long_to_panel(bars, tickers=tickers)
-    dates = panel["adj_close"].index
-    tradable_mask_df = build_tradable_mask(panel)
-    tradable_mask = tradable_mask_df.to_numpy(dtype=bool)
-
+    if pd.Timestamp(args.start) > pd.Timestamp(args.end):
+        raise ValueError("--start must be on or before --end")
+    if args.horizon < 1:
+        raise ValueError("--horizon must be positive")
+    if args.financial_lag_days < 1 or args.financial_lookback_days < 0:
+        raise ValueError("financial lag must be positive and lookback nonnegative")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     financial_report_start = (
         pd.Timestamp(args.start) - pd.Timedelta(days=args.financial_lookback_days)
     ).date().isoformat()
-    fin_path = cache_dir / (
-        f"financials_{args.financial_timeframe}_{financial_report_start}_{args.end}_"
-        f"{args.financial_limit}_{len(tickers)}.parquet"
-    )
-    def fetch_financials_one(i: int, t: str) -> pd.DataFrame:
-        print(f"financials {i}/{len(tickers)} {t}", flush=True)
-        try:
-            return download_financials(
-                client,
-                t,
-                timeframe=args.financial_timeframe,
-                limit=args.financial_limit,
-                period_of_report_date_gte=financial_report_start,
-                period_of_report_date_lte=args.end,
-            )
-        except Exception as e:
-            print(f"WARN financials failed {t}: {e}", flush=True)
-            return pd.DataFrame()
+    with WRDSClient(
+        wrds_username=args.wrds_username,
+        cache_dir=Path(args.cache_dir),
+        use_cache=not args.no_cache,
+    ) as client:
+        membership = download_nasdaq_membership(client, args.start, args.end)
+        validate_wrds_source(membership, "NASDAQ membership")
+        tickers_df = download_security_metadata(client, membership)
+        validate_wrds_source(tickers_df, "Security metadata")
+        tickers_df = tickers_df.sort_values("ticker").reset_index(drop=True)
+        tickers = tickers_df["ticker"].astype(str).tolist()
+        if len(tickers) != len(set(tickers)):
+            raise ValueError("WRDS security identifiers must be unique")
+        bars = download_daily_bars(client, membership, args.start, args.end)
+        validate_wrds_source(bars, "Daily bars")
+        fin_flat = download_fundamentals(
+            client, membership, financial_report_start, args.end,
+            lag_days=args.financial_lag_days,
+        )
 
-    def build_financials():
-        frames = []
-        if args.financial_workers <= 1:
-            for i, t in enumerate(tickers, 1):
-                df = fetch_financials_one(i, t)
-                if not df.empty:
-                    frames.append(df)
-        else:
-            with ThreadPoolExecutor(max_workers=args.financial_workers) as executor:
-                futures = [
-                    executor.submit(fetch_financials_one, i, t)
-                    for i, t in enumerate(tickers, 1)
-                ]
-                for future in as_completed(futures):
-                    df = future.result()
-                    if not df.empty:
-                        frames.append(df)
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    fin_raw = read_or_build(fin_path, use_cache, build_financials)
-    fin_flat = flatten_financials(fin_raw, lag_days=args.financial_lag_days) if not fin_raw.empty else pd.DataFrame()
+    panel = bars_long_to_panel(bars, tickers=tickers)
+    dates = panel["adj_close"].index
+    caps = bars.pivot(index="date", columns="ticker", values="market_cap")
+    caps.index = pd.to_datetime(caps.index).normalize()
+    members = build_nasdaq_membership_mask(membership, dates, tickers)
+    cap_mask = exclude_bottom_market_cap(caps, members)
+    tradable_mask_df = build_tradable_mask(panel) & cap_mask
+    for row in tickers_df.itertuples(index=False):
+        delisted = pd.to_datetime(getattr(row, "delisted_utc", None), errors="coerce")
+        if pd.notna(delisted):
+            tradable_mask_df.loc[dates >= delisted, row.ticker] = False
+    tradable_mask = tradable_mask_df.to_numpy(dtype=bool)
+    if not tradable_mask.any():
+        raise ValueError("No eligible NASDAQ securities after market-cap and tradability filters")
+
+    membership.to_parquet(out_dir / "nasdaq_membership.parquet", index=False)
+    bars.to_parquet(out_dir / "daily_bars.parquet", index=False)
     if not fin_flat.empty:
         fin_flat.to_parquet(out_dir / "financials_flat.parquet", index=False)
-    if args.financial_timeframe == "quarterly" and not fin_flat.empty:
-        fin_model = build_ttm_financials(fin_flat, min_quarters=args.ttm_min_quarters)
-        if not fin_model.empty:
-            fin_model.to_parquet(out_dir / "financials_ttm.parquet", index=False)
     else:
-        fin_model = fin_flat
+        (out_dir / "financials_flat.parquet").unlink(missing_ok=True)
+    fin_model = build_ttm_financials(fin_flat, min_quarters=args.ttm_min_quarters)
+    if not fin_model.empty:
+        fin_model.to_parquet(out_dir / "financials_ttm.parquet", index=False)
+    else:
+        (out_dir / "financials_ttm.parquet").unlink(missing_ok=True)
     fund_daily = fundamentals_to_daily(fin_model, dates, tickers) if not fin_model.empty else {}
 
     pv_factors = build_price_volume_factors(panel)
-    fundamental_factors = build_fundamental_factors(fund_daily, panel["adj_close"]) if fund_daily else {}
+    fundamental_factors = build_fundamental_factors(
+        fund_daily, panel["raw_close"], market_cap=caps.reindex(index=dates, columns=tickers),
+    ) if fund_daily else {}
     factors = apply_universe_mask({**pv_factors, **fundamental_factors}, tradable_mask_df)
 
     X, factor_names, preprocess_diag = build_exposure_tensor(
@@ -257,8 +159,16 @@ def main():
         panel["adj_close"],
         horizon=args.horizon,
         max_abs_return=max_abs_forward_return,
+        ticker_metadata=tickers_df,
     ).where(tradable_mask_df)
     r = r_df.to_numpy(dtype=float)
+    terminal_return_mask = np.zeros_like(tradable_mask)
+    for i, event in enumerate(delisting_dates(tickers_df, tickers)):
+        if pd.notna(event):
+            terminal_return_mask[:-args.horizon, i] = (
+                (dates[:-args.horizon] < event) & (dates[args.horizon:] >= event)
+            )
+    terminal_return_mask &= np.isfinite(r)
     ridge_value = parse_ridge(args.ridge)
     f, ridge_diag = estimate_factor_returns(
         X,
@@ -277,6 +187,11 @@ def main():
     np.save(out_dir / "r.npy", r)
     np.save(out_dir / "factor_returns.npy", f)
     np.save(out_dir / "tradable_mask.npy", tradable_mask)
+    np.save(out_dir / "terminal_return_mask.npy", terminal_return_mask)
+    # Old targets may have the same dimensions after a source/ranking refresh.
+    # They must be regenerated from the newly estimated factors.
+    for name in ("weights.npy", "positions.npy", "scores.npy", "f_pred.npy"):
+        (out_dir / name).unlink(missing_ok=True)
     tickers_df.to_csv(out_dir / "tickers.csv", index=False)
     pd.DataFrame({"date": dates}).to_csv(out_dir / "dates.csv", index=False)
     pd.DataFrame({"factor": factor_names}).to_csv(out_dir / "factor_names.csv", index=False)
@@ -299,17 +214,21 @@ def main():
 
     summary = {
         "data_policy": {
-            "prices": "Massive grouped daily bars adjusted=true; daily OHLCV only available after market date.",
-            "fundamentals": "Massive financials endpoint; quarterly rows are converted to point-in-time TTM flow fields before daily forward-fill. Each filing is available from filing_date if provided, otherwise end_date + financial_lag_days.",
-            "look_ahead_bias_control": "Fundamentals are point-in-time merged by available_date then forward-filled. Future filings are never backfilled into earlier trading dates. Returns use adj_close[t+h]/adj_close[t]-1 and outlier forward returns are dropped when max_abs_forward_return is set.",
-            "universe": f"Massive ticker metadata exchange={args.exchange}, ticker_status={args.ticker_status}; selected by universe_rank_by={args.universe_rank_by}, max_tickers={args.max_tickers}.",
-            "tradable_mask": "date x ticker mask from finite positive adjusted close and positive volume; applied before factor preprocessing and during regression.",
-            "api_cache": f"Raw Massive API JSON responses are cached under {api_cache_display} unless --no-api-cache is set.",
+            "source": "compustat_wrds",
+            "prices": "Compustat sec_dprc through WRDS; split-adjusted daily OHLC/volume with separate raw prices and same-day market_cap.",
+            "fundamentals": "Compustat fundq; reported availability plus lag fallback; quarterly flows converted to trailing four quarters. Standard Compustat may contain restatements and is not a vintage filing database.",
+            "look_ahead_bias_control": "Historical NASDAQ exchange intervals, same-date capitalization, and backward-only financial availability; no future ranking window.",
+            "universe": "All Compustat-covered historical NASDAQ securities (EXCHG=14); no current-active-only filter or fixed top-N selection.",
+            "bottom_market_cap_fraction": 0.20,
+            "tradable_mask": "Per-date membership, positive market cap excluding bottom ceil(20%), positive price/volume, and no confirmed inactivation on/before the signal date.",
+            "delisting_recovery_fraction": 0.50,
+            "delisting": "Compustat security inactivation date/reason is the termination proxy; recover 50% of the final valid pre-event price. Index/exchange departures and missing quotes alone are not termination events.",
+            "cache": "Only query-keyed Compustat/WRDS caches; old vendor caches are never reused.",
         },
         "params": vars(args),
         "n_dates": len(dates),
         "n_tickers": len(tickers),
-        "n_financial_rows_raw": int(len(fin_raw)),
+        "n_membership_intervals": int(len(membership)),
         "n_financial_rows_flat": int(len(fin_flat)),
         "n_financial_rows_model": int(len(fin_model)),
         "n_factors_raw": len(factors),

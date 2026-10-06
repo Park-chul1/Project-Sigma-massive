@@ -1,6 +1,6 @@
-input_dir: data/processed_clean
+input_dir: data/processed_wrds
 out_dir: data/close_to_next_open_backtest
-daily_bars_path: data/cache_clean/grouped_daily_2019-01-01_2024-12-31.parquet
+daily_bars_path: data/processed_wrds/daily_bars.parquet
 reports_dir: reports/daily
 rebalance_frequency: daily
 holding_period_days: 1

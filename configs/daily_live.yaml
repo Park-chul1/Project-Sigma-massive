@@ -1,6 +1,6 @@
-input_dir: data/processed_daily_20260512
+input_dir: data/processed_wrds
 out_dir: data/daily_live_preview
-daily_bars_path: data/cache_daily_20260512/grouped_daily_2023-01-01_2026-05-12.parquet
+daily_bars_path: data/processed_wrds/daily_bars.parquet
 reports_dir: reports/daily
 rebalance_frequency: daily
 holding_period_days: 1

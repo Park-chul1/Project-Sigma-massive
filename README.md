@@ -1,6 +1,6 @@
 # Project Sigma — Cross-Sectional Factor Model Pipeline
 
-Project Sigma is a daily cross-sectional equity factor research pipeline built with Massive/Polygon-compatible market and fundamental data.
+Project Sigma is a daily cross-sectional equity factor research pipeline built with Compustat North America data accessed exclusively through WRDS. The universe remains all Compustat-covered NASDAQ securities, including historical inactive issues.
 
 The project constructs factor exposures, estimates daily factor returns with cross-sectional regression, forecasts factor returns from recent history, converts them into stock-level scores, and evaluates long/short portfolios through backtesting and paper execution.
 
@@ -315,9 +315,19 @@ and are used to inspect dates or securities where the factor model explains retu
 
 ## Data Note
 
-The project uses Massive/Polygon-compatible market and financial-statement data and includes controls for inactive securities, tradability, and point-in-time-style fundamental availability.
+The only market/fundamental data source is **Compustat through WRDS**. The universe remains **NASDAQ**, not S&P 500. Historical exchange intervals in `comp.sec_history` (`EXCHG=14`) determine membership on each date; current active status and current ticker symbols are not used to reconstruct past membership. Model columns use stable `gvkey_iid` security identifiers, while `symbol` is retained for display and broker mapping.
 
-The historical dataset may not represent a perfectly reconstructed point-in-time universe. Historical membership, delisting treatment, filing availability, and corporate actions can affect backtest results, so performance statistics should be interpreted with those limitations in mind.
+Every signal date excludes the **bottom 20% by observed market capitalization** (`raw close × shares outstanding`). The number removed is rounded up, ties are broken by stable security ID, and missing/nonpositive capitalization is excluded. Ranking uses that date's NASDAQ members before liquidity filters; no full-period or end-of-backtest ranking is used. This rule also applies to shorts and cannot be undone by turnover smoothing.
+
+For a confirmed security termination, recovery is **50% of the last valid pre-event price**, with consistent price adjustment for returns. For example, a final price of $80 settles at $40. The same underlying return is applied to long and short positions. Compustat's `security.dldtei` plus `dlrsni` provides the security-inactivation proxy; it is not an exact exchange delisting feed. An exchange departure, inactive flag, or missing quote alone never triggers this assumption. Ordinary missing execution/exit prices fail explicitly.
+
+Prices are split-adjusted daily OHLC, with raw prices retained for order sizing; the model uses split-adjusted price returns. `total_return_close` is also retained when available. Quarterly Compustat financials use announcement availability and conservative lag fallback, with year-to-date cash flows converted to quarterly increments. Standard `fundq` can contain later restatements and is not a vintage/as-reported filing database.
+
+Compustat does not guarantee coverage of every NASDAQ-listed instrument (for example, all ETFs). Historical exchange coverage begins on 1998-04-01. The pipeline refuses earlier ranges and missing required data rather than substituting another source. It requires WRDS access to Compustat security history, security daily prices/returns, and quarterly fundamentals. See the [WRDS historical identifier documentation](https://wrds-www.wharton.upenn.edu/pages/wrds-research/database-linking-matrix/using-compustat-historical-identifier-notebook/) and [Compustat security header fields](https://www.crsp.org/wp-content/uploads/ccm_files/SecurityHeader.html).
+
+Old provider caches and previous backtest reports are historical artifacts. Rebuild the pipeline into `data/processed_wrds` before using the new backtest or execution flow; legacy artifacts without WRDS provenance, exchange intervals, and daily capitalization are rejected. Rebuilding removes generated target arrays in that output directory so old positions cannot be reused against new factors.
+
+An inactivation date can lag the final quote. Unresolved quote gaps before that date still stop the execution backtest; they are not silently marked at zero or assigned an early recovery date. The 50% rule applies to return intervals that cross the confirmed event and have a valid entry basis. Forecasts currently require a one-session return horizon.
 
 ## Paper Execution
 
@@ -333,21 +343,31 @@ Next-session submission
 Fill / exposure / execution monitoring
 ```
 
-Intraday monitoring is separated from alpha recomputation so delayed intraday data does not change the original daily signal.
+WRDS supplies daily research data. Broker account/order monitoring remains available, but market-price downloads and intraday quote streams from other providers have been removed. IBKR remains the order-routing broker. Saved raw signal-date prices are used for sizing.
 
 ## Installation
 
 ```bash
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Set the Massive API key:
+Use Python 3.12 and configure your WRDS username and standard WRDS authentication (`.pgpass`/institutional access). Do not store passwords in the repository:
 
 ```bash
-export MASSIVE_API_KEY="your_key"
+export WRDS_USERNAME="your_wrds_username"
 ```
+
+Store the password in `~/.pgpass` (outside the repository), retaining any other database entries:
+
+```text
+wrds-pgdata.wharton.upenn.edu:9737:wrds:your_wrds_username:your_wrds_password
+```
+
+Set `chmod 600 ~/.pgpass`. Do not quote the fields; escape literal `:` as `\:` and `\` as `\\`. `WRDS_USERNAME` must match the username in this entry. An `export` in one terminal does not update other terminals or the IDE's already-running processes.
+
+For authentication errors, first confirm the same credentials work on the WRDS website and complete Duo Mobile push approval from the same network/IP. PostgreSQL access supports Duo **push**, not a generated passcode or SMS. See the [WRDS MFA instructions](https://wrds-www.wharton.upenn.edu/pages/about/log-in-to-wrds-using-two-factor-authentication/). `PAM authentication failed` means the server rejected authentication; it alone does not distinguish incorrect credentials, account restrictions, and MFA failure. Connection errors now report a credential-free category, with a 60-second connection timeout to allow push approval.
 
 ## Example Run
 
@@ -357,15 +377,14 @@ Build the pipeline:
 python scripts/run_clean_pipeline.py \
   --start 2023-01-01 \
   --end 2026-01-01 \
-  --ticker-status all \
-  --out-dir data/nasdaq_full
+  --out-dir data/processed_wrds
 ```
 
 Run a factor backtest:
 
 ```bash
 python scripts/run_backtest.py \
-  --input-dir data/nasdaq_full \
+  --input-dir data/processed_wrds \
   --method ewma \
   --lookback 120 \
   --quantile 0.10 \
@@ -380,6 +399,8 @@ python scripts/run_close_to_next_open_backtest.py \
 ```
 
 ## Main Outputs
+
+`nasdaq_membership.parquet` stores historical exchange intervals; `daily_bars.parquet` stores WRDS prices and capitalization. Both are required by downstream jobs. `tickers.csv` records stable IDs, broker symbols, and security termination metadata.
 
 ```text
 X.npy                         # T x N x K exposure tensor
@@ -422,7 +443,7 @@ factor_pipeline/
 ├── preprocess.py
 ├── fundamental_factors.py
 ├── price_volume_factors.py
-├── massive_client.py
+├── wrds_client.py
 └── ...
 
 backtests/
@@ -434,4 +455,3 @@ scripts/
 tests/
 tools/
 ```
-

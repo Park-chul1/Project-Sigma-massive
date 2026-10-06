@@ -23,7 +23,6 @@ def main() -> None:
     p.add_argument("--paper-account", default=None)
     p.add_argument("--paper-dry-run", action="store_true", help="Build paper orders but do not call IBKR placeOrder")
     p.add_argument("--max-paper-orders", type=int, default=None)
-    p.add_argument("--use-live-prices", action="store_true", help="Request IBKR snapshots before falling back to report signal prices")
     p.add_argument("--paper-transaction-cost-bps", type=float, default=1.0)
     p.add_argument("--paper-slippage-bps", type=float, default=2.0)
     p.add_argument("--paper-min-net-alpha-after-cost-bps", type=float, default=5.0)
@@ -44,7 +43,6 @@ def main() -> None:
                 account=args.paper_account,
                 dry_run=args.paper_dry_run,
                 max_orders=args.max_paper_orders,
-                use_live_prices=args.use_live_prices,
                 transaction_cost_bps=args.paper_transaction_cost_bps,
                 slippage_bps=args.paper_slippage_bps,
                 min_net_alpha_after_cost_bps=args.paper_min_net_alpha_after_cost_bps,

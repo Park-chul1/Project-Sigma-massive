@@ -13,11 +13,12 @@ if str(ROOT) not in sys.path:
 
 from factor_pipeline.backtest import run_factor_backtest
 from factor_pipeline.diagnostics import save_json, array_summary
+from factor_pipeline.universe import load_wrds_universe_mask
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run long-short backtest from saved factor pipeline outputs")
-    p.add_argument("--input-dir", default="data/processed_clean")
+    p.add_argument("--input-dir", default="data/processed_wrds")
     p.add_argument("--out-dir", default=None)
     p.add_argument("--method", default="latest", choices=["latest", "rolling", "ewma", "zero", "oracle"])
     p.add_argument("--lookback", type=int, default=20)
@@ -49,13 +50,17 @@ def main():
     tradable_mask = np.load(input_dir / "tradable_mask.npy")
 
     dates_path = input_dir / "dates.csv"
-    dates = pd.read_csv(dates_path)["date"] if dates_path.exists() else pd.Series(range(X.shape[0]), name="date")
+    dates = pd.read_csv(dates_path)["date"]
+    tickers = pd.read_csv(input_dir / "tickers.csv", dtype={"ticker": str})["ticker"].tolist()
+    policy_mask = load_wrds_universe_mask(input_dir, pd.DatetimeIndex(pd.to_datetime(dates)), tickers)
+    tradable_mask &= policy_mask.to_numpy(dtype=bool)
 
     result = run_factor_backtest(
         X=X,
         r=r,
         f=f,
         tradable_mask=tradable_mask,
+        terminal_return_mask=np.load(input_dir / "terminal_return_mask.npy"),
         method=args.method,
         lookback=args.lookback,
         ewma_halflife=args.ewma_halflife,

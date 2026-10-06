@@ -11,6 +11,8 @@ import numpy as np
 import pandas as pd
 
 from factor_pipeline.signals import predict_factor_returns
+from factor_pipeline.panel import DELISTING_RECOVERY_FRACTION, delisting_dates
+from factor_pipeline.universe import build_nasdaq_membership_mask, exclude_bottom_market_cap, validate_wrds_source
 
 
 REQUIRED_REPORT_FILES = [
@@ -33,7 +35,7 @@ REQUIRED_REPORT_FILES = [
 
 @dataclass(frozen=True)
 class DailyBacktestConfig:
-    input_dir: Path = Path("data/processed_clean")
+    input_dir: Path = Path("data/processed_wrds")
     out_dir: Path = Path("data/close_to_next_open_backtest")
     daily_bars_path: Path | None = None
     execution_bars_path: Path | None = None
@@ -80,8 +82,6 @@ class DailyBacktestConfig:
     use_point_in_time_universe: bool = True
     missing_execution_policy: str = "fail"
     missing_price_policy: str = "fail"
-    missing_exit_long_return: float = -1.0
-    missing_exit_short_return: float = 1.0
     cost_basis: str = "full_notional"
 
     def validate(self) -> None:
@@ -137,12 +137,12 @@ class DailyBacktestConfig:
             raise ValueError("min_risk_scale must be between 0 and max_leverage_multiplier")
         if self.missing_execution_policy not in {"fail", "drop"}:
             raise ValueError("missing_execution_policy must be fail or drop")
-        if self.missing_price_policy not in {"fail", "terminal_return", "zero"}:
-            raise ValueError("missing_price_policy must be fail, terminal_return, or zero")
+        if not self.use_point_in_time_universe:
+            raise ValueError("Point-in-time NASDAQ membership and market-cap exclusion are mandatory")
+        if self.missing_price_policy != "fail":
+            raise ValueError("missing_price_policy must be fail; only confirmed delistings receive 50% recovery")
         if self.cost_basis not in {"full_notional", "half_turnover"}:
             raise ValueError("cost_basis must be full_notional or half_turnover")
-        if not np.isfinite(self.missing_exit_long_return) or not np.isfinite(self.missing_exit_short_return):
-            raise ValueError("missing exit returns must be finite")
 
 
 @dataclass
@@ -188,6 +188,12 @@ def load_processed_inputs(input_dir: Path) -> dict[str, Any]:
     ticker_col = "ticker" if "ticker" in tickers_df.columns else tickers_df.columns[0]
     tickers = tickers_df[ticker_col].astype(str).tolist()[: X.shape[1]]
     ticker_metadata = tickers_df.iloc[: X.shape[1]].copy()
+    validate_wrds_source(ticker_metadata, "processed ticker metadata")
+    membership_path = input_dir / "nasdaq_membership.parquet"
+    if not membership_path.exists():
+        raise ValueError("Processed inputs require Compustat WRDS nasdaq_membership.parquet; rebuild the pipeline")
+    membership = pd.read_parquet(membership_path)
+    validate_wrds_source(membership, "NASDAQ membership")
     factor_df = pd.read_csv(input_dir / "factor_names.csv")
     factor_col = "factor" if "factor" in factor_df.columns else factor_df.columns[0]
     factor_names = factor_df[factor_col].astype(str).tolist()[: X.shape[2]]
@@ -199,6 +205,7 @@ def load_processed_inputs(input_dir: Path) -> dict[str, Any]:
         "dates": pd.DatetimeIndex(dates),
         "tickers": tickers,
         "ticker_metadata": ticker_metadata,
+        "membership": membership,
         "factor_names": factor_names,
     }
 
@@ -207,12 +214,13 @@ def load_daily_price_panels(path: Path | None, dates: pd.DatetimeIndex, tickers:
     if path is None or not path.exists():
         return {}
     bars = pd.read_parquet(path)
+    validate_wrds_source(bars, "daily price bars")
     if "date" not in bars.columns or "ticker" not in bars.columns:
         raise ValueError("daily_bars_path must contain date and ticker columns")
     bars = bars.copy()
     bars["date"] = pd.to_datetime(bars["date"]).dt.normalize()
     panels: dict[str, pd.DataFrame] = {}
-    for col in ["open", "close", "vwap", "volume"]:
+    for col in ["open", "close", "vwap", "volume", "raw_open", "raw_close", "raw_volume", "market_cap"]:
         if col in bars.columns:
             panels[col] = (
                 bars.pivot_table(index="date", columns="ticker", values=col, aggfunc="last")
@@ -415,6 +423,8 @@ def build_daily_weights(
             turnover = 0.5 * np.abs(target - prev).sum()
             if turnover > cfg.turnover_cap and turnover > 0:
                 target = prev + (target - prev) * (cfg.turnover_cap / turnover)
+        # Membership/capitalization exclusions override the turnover budget.
+        target[~tradable[t]] = 0.0
         if price_t is not None and cfg.min_price > 0:
             price_ok = np.isfinite(price_t) & (price_t >= cfg.min_price)
             target[~price_ok] = 0.0
@@ -448,106 +458,105 @@ def compute_execution_returns(
     cfg: DailyBacktestConfig,
     tickers: list[str] | None = None,
     return_panels: dict[str, pd.DataFrame] | None = None,
+    ticker_metadata: pd.DataFrame | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame, list[str]]:
     warnings: list[str] = []
     T, N = weights.shape
     realized = np.full((T, N), np.nan)
-    signal_price = np.full((T, N), np.nan)
     execution_price = np.full((T, N), np.nan)
     exit_price = np.full((T, N), np.nan)
-    if {"open", "close"}.issubset(panels):
-        open_arr = panels["open"].to_numpy(dtype=float)
-        close_arr = panels["close"].to_numpy(dtype=float)
-        pnl_panels = return_panels if return_panels is not None and {"open", "close"}.issubset(return_panels) else panels
-        return_open_arr = pnl_panels["open"].to_numpy(dtype=float)
-        return_close_arr = pnl_panels["close"].to_numpy(dtype=float)
-        signal_price = close_arr.copy()
-        return_execution_price = np.full((T, N), np.nan)
-        return_exit_price = np.full((T, N), np.nan)
-        for t in range(T - cfg.holding_period_days):
-            exec_t = t + 1
-            exit_t = min(exec_t + cfg.holding_period_days, T - 1)
-            execution_price[t] = open_arr[exec_t]
-            exit_price[t] = open_arr[exit_t] if exit_t != exec_t else close_arr[exec_t]
-            return_execution_price[t] = return_open_arr[exec_t]
-            return_exit_price[t] = return_open_arr[exit_t] if exit_t != exec_t else return_close_arr[exec_t]
-            valid_exec = np.isfinite(execution_price[t]) & (execution_price[t] > 0)
-            valid_exit = np.isfinite(exit_price[t]) & (exit_price[t] > 0)
-            valid_return_exec = np.isfinite(return_execution_price[t]) & (return_execution_price[t] > 0)
-            valid_return_exit = np.isfinite(return_exit_price[t]) & (return_exit_price[t] > 0)
-            valid = valid_exec & valid_exit & valid_return_exec & valid_return_exit
-            with np.errstate(divide="ignore", invalid="ignore"):
-                realized[t, valid] = return_exit_price[t, valid] / return_execution_price[t, valid] - 1.0
+    exit_dates = np.full((T, N), np.datetime64("NaT", "ns"), dtype="datetime64[ns]")
+    if not {"open", "close"}.issubset(panels):
+        raise ValueError("WRDS daily bars with open and close are required for execution returns")
+    tickers = tickers if tickers is not None else list(panels["open"].columns)
+    open_arr = panels.get("raw_open", panels["open"]).to_numpy(dtype=float)
+    close_arr = panels.get("raw_close", panels["close"]).to_numpy(dtype=float)
+    pnl_panels = return_panels if return_panels is not None else panels
+    return_open_arr = pnl_panels["open"].to_numpy(dtype=float)
+    return_close_arr = pnl_panels["close"].to_numpy(dtype=float)
+    signal_price = close_arr.copy()
+    return_execution_price = np.full((T, N), np.nan)
+    return_exit_price = np.full((T, N), np.nan)
+    events = delisting_dates(ticker_metadata, tickers)
+    known_events = [(i, event, int(dates.searchsorted(event, side="left"))) for i, event in enumerate(events) if pd.notna(event)]
+    settled = np.zeros((T, N), dtype=bool)
+    blocked_entry = np.zeros((T, N), dtype=bool)
 
-        executable = np.zeros((T, N), dtype=bool)
-        executable[: max(0, T - cfg.holding_period_days), :] = True
+    def last_quote(opens: np.ndarray, closes: np.ndarray, start: int, end: int, column: int) -> float:
+        # Opens precede closes; never search before entry or beyond the event.
+        quotes = np.column_stack([opens[start:end, column], closes[start:end, column]]).reshape(-1)
+        valid = quotes[np.isfinite(quotes) & (quotes > 0)]
+        return float(valid[-1]) if valid.size else np.nan
+
+    for t in range(max(0, T - cfg.holding_period_days)):
+        exec_t = t + 1
+        exit_t = min(exec_t + cfg.holding_period_days, T - 1)
+        execution_price[t] = open_arr[exec_t]
+        exit_price[t] = open_arr[exit_t] if exit_t != exec_t else close_arr[exec_t]
+        return_execution_price[t] = return_open_arr[exec_t]
+        return_exit_price[t] = return_open_arr[exit_t] if exit_t != exec_t else return_close_arr[exec_t]
+        exit_dates[t] = dates[exit_t].to_datetime64()
+        for i, event, event_end in known_events:
+            if event <= dates[exec_t]:
+                blocked_entry[t, i] = True
+                execution_price[t, i] = np.nan
+                exit_price[t, i] = np.nan
+                return_execution_price[t, i] = np.nan
+                return_exit_price[t, i] = np.nan
+            elif event <= dates[exit_t]:
+                exit_price[t, i] = DELISTING_RECOVERY_FRACTION * last_quote(open_arr, close_arr, exec_t, event_end, i)
+                return_exit_price[t, i] = DELISTING_RECOVERY_FRACTION * last_quote(return_open_arr, return_close_arr, exec_t, event_end, i)
+                exit_dates[t, i] = event.to_datetime64()
+                settled[t, i] = True
+        valid = (
+            np.isfinite(execution_price[t]) & (execution_price[t] > 0)
+            & np.isfinite(exit_price[t]) & (exit_price[t] > 0)
+            & np.isfinite(return_execution_price[t]) & (return_execution_price[t] > 0)
+            & np.isfinite(return_exit_price[t]) & (return_exit_price[t] > 0)
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            realized[t, valid] = return_exit_price[t, valid] / return_execution_price[t, valid] - 1.0
+
+    blocked_active = blocked_entry & (np.abs(weights) > 1e-12)
+    if blocked_active.any():
+        warnings.append(f"Orders on or after a confirmed security delisting were unfilled. count={int(blocked_active.sum())}")
+    weights[blocked_entry] = 0.0
+    executable = np.zeros((T, N), dtype=bool)
+    executable[: max(0, T - cfg.holding_period_days)] = True
+    active = executable & (np.abs(weights) > 1e-12)
+    missing_execution = active & ~(np.isfinite(execution_price) & (execution_price > 0))
+    if missing_execution.any():
+        sample = _format_missing_price_samples(missing_execution, dates, tickers)
+        if cfg.missing_execution_policy == "fail":
+            raise RuntimeError(f"Missing next-open execution price for active positions. count={int(missing_execution.sum())}, sample={sample}")
+        weights[missing_execution] = 0.0
+        warnings.append(f"Missing next-open prices caused orders to be treated as unfilled (missing_execution_policy=drop). count={int(missing_execution.sum())}, sample={sample}")
         active = executable & (np.abs(weights) > 1e-12)
-        missing_execution = active & ~(np.isfinite(execution_price) & (execution_price > 0))
-        if missing_execution.any():
-            sample = _format_missing_price_samples(missing_execution, dates, tickers)
-            if cfg.missing_execution_policy == "fail":
-                raise RuntimeError(
-                    "Missing next-open execution price for active positions; refusing to mark these trades as zero return. "
-                    f"count={int(missing_execution.sum())}, sample={sample}"
-                )
-            weights[missing_execution] = 0.0
-            warnings.append(
-                "Missing next-open execution prices caused orders to be treated as unfilled and removed from realized weights "
-                f"because missing_execution_policy=drop. count={int(missing_execution.sum())}, sample={sample}"
-            )
-            active = executable & (np.abs(weights) > 1e-12)
-        missing_exit = active & np.isfinite(execution_price) & (execution_price > 0) & ~(np.isfinite(exit_price) & (exit_price > 0))
-        if missing_exit.any():
-            if cfg.missing_price_policy == "fail":
-                sample = _format_missing_price_samples(missing_exit, dates, tickers)
-                raise RuntimeError(
-                    "Missing exit price for active positions; refusing to mark these trades as zero return. "
-                    f"count={int(missing_exit.sum())}, sample={sample}. "
-                    "Set missing_price_policy=terminal_return only when a conservative delist haircut is intended."
-                )
-            if cfg.missing_price_policy == "terminal_return":
-                realized[missing_exit & (weights > 0)] = cfg.missing_exit_long_return
-                realized[missing_exit & (weights < 0)] = cfg.missing_exit_short_return
-                warnings.append(
-                    "Missing exit prices were replaced with configured terminal returns "
-                    f"(long={cfg.missing_exit_long_return}, short={cfg.missing_exit_short_return})."
-                )
-            elif cfg.missing_price_policy == "zero":
-                realized[missing_exit] = 0.0
-                warnings.append("Missing exit prices were replaced with zero returns because missing_price_policy=zero.")
-        missing_return_price = active & np.isfinite(execution_price) & (execution_price > 0) & np.isfinite(exit_price) & (exit_price > 0) & ~np.isfinite(realized)
-        if missing_return_price.any():
-            sample = _format_missing_price_samples(missing_return_price, dates, tickers)
-            raise RuntimeError(
-                "Adjusted return price is missing for active positions with valid raw execution prices. "
-                f"count={int(missing_return_price.sum())}, sample={sample}"
-            )
-    elif saved_r is not None:
-        warnings.append("daily_bars_path was not provided/found; realized returns fall back to saved r.npy, so execution_price is unavailable.")
-        realized = saved_r.copy()
-    else:
-        warnings.append("No daily bars or r.npy available; PnL cannot be computed.")
+    missing_exit = active & ~(np.isfinite(exit_price) & (exit_price > 0))
+    if missing_exit.any():
+        sample = _format_missing_price_samples(missing_exit, dates, tickers)
+        raise RuntimeError(f"Missing exit price for active positions without a confirmed, priceable delisting; ordinary quote gaps cannot receive a recovery assumption. count={int(missing_exit.sum())}, sample={sample}")
+    missing_return_price = active & ~np.isfinite(realized)
+    if missing_return_price.any():
+        sample = _format_missing_price_samples(missing_return_price, dates, tickers)
+        raise RuntimeError(f"Adjusted return price is missing for active positions with valid raw execution prices. count={int(missing_return_price.sum())}, sample={sample}")
+    if (settled & active).any():
+        warnings.append(f"Confirmed delistings settled at 50% of the last valid pre-event price. count={int((settled & active).sum())}")
     if cfg.max_abs_return is not None:
-        clipped = np.isfinite(realized) & (np.abs(realized) > cfg.max_abs_return)
-        realized = np.where(~clipped, realized, np.nan)
-        active_mask = locals().get("active")
-        if isinstance(active_mask, np.ndarray):
-            clipped_active = clipped & active_mask
-            if clipped_active.any():
-                sample = _format_missing_price_samples(clipped_active, dates, tickers)
-                raise RuntimeError(
-                    "Execution return exceeded max_abs_return for active positions; refusing to convert it to zero return. "
-                    f"count={int(clipped_active.sum())}, sample={sample}. "
-                    "Increase max_abs_return or set it to null only after inspecting the raw prices."
-                )
+        clipped = np.isfinite(realized) & (np.abs(realized) > cfg.max_abs_return) & ~settled
+        if (clipped & active).any():
+            sample = _format_missing_price_samples(clipped & active, dates, tickers)
+            raise RuntimeError(f"Execution return exceeded max_abs_return for active positions. sample={sample}")
+        realized[clipped] = np.nan
     prices = pd.DataFrame({
         "signal_date": np.repeat(dates.to_numpy(), N),
-        "execution_date": np.repeat(np.r_[dates.to_numpy()[1:], np.datetime64("NaT")], N),
-        "exit_date": np.repeat(np.r_[dates.to_numpy()[1 + cfg.holding_period_days:], np.full(min(1 + cfg.holding_period_days, T), np.datetime64("NaT"))], N)[: T * N],
+        "execution_date": np.repeat(np.r_[dates.to_numpy()[1:], np.datetime64("NaT", "ns")], N),
+        "exit_date": exit_dates.reshape(-1),
         "ticker_index": np.tile(np.arange(N), T),
         "signal_price": signal_price.reshape(-1),
         "execution_price": execution_price.reshape(-1),
         "exit_price": exit_price.reshape(-1),
+        "delisting_settlement": settled.reshape(-1),
     })
     return realized, prices, warnings
 
@@ -599,7 +608,12 @@ def _cost_notional_from_half_turnover(half_turnover: float, cfg: DailyBacktestCo
     return 2.0 * half_turnover
 
 
-def apply_dynamic_risk_controls(weights: np.ndarray, realized: np.ndarray, cfg: DailyBacktestConfig) -> tuple[np.ndarray, pd.DataFrame]:
+def apply_dynamic_risk_controls(
+    weights: np.ndarray,
+    realized: np.ndarray,
+    cfg: DailyBacktestConfig,
+    eligible: np.ndarray | None = None,
+) -> tuple[np.ndarray, pd.DataFrame]:
     adjusted = np.zeros_like(weights, dtype=float)
     rows: list[dict[str, float]] = []
     prev = np.zeros(weights.shape[1], dtype=float)
@@ -613,6 +627,8 @@ def apply_dynamic_risk_controls(weights: np.ndarray, realized: np.ndarray, cfg: 
             turnover = 0.5 * float(np.abs(target - prev).sum())
             if turnover > cfg.turnover_cap and turnover > 0:
                 target = prev + (target - prev) * (cfg.turnover_cap / turnover)
+        if eligible is not None:
+            target[~eligible[t]] = 0.0
         adjusted[t] = target
         r = np.where(np.isfinite(realized[t]), realized[t], 0.0)
         gross_turnover = 0.5 * float(np.abs(target - prev).sum())
@@ -915,21 +931,31 @@ def run_close_to_next_open_backtest(cfg: DailyBacktestConfig) -> DailyBacktestRe
         saved_r = saved_r[date_mask] if saved_r is not None else None
         tradable = tradable[date_mask]
         dates = dates[date_mask]
-    pit_stats = {"enabled": False}
-    if cfg.use_point_in_time_universe:
-        pit_mask, pit_warnings, pit_stats = build_point_in_time_universe_mask(ticker_metadata, dates, tickers)
-        tradable = np.asarray(tradable, dtype=bool) & pit_mask
-        warnings.extend(pit_warnings)
-    exec_bars_path = execution_bars_path(cfg)
+    pit_mask, pit_warnings, pit_stats = build_point_in_time_universe_mask(ticker_metadata, dates, tickers)
+    membership_mask = build_nasdaq_membership_mask(data["membership"], dates, tickers)
+    warnings.extend(pit_warnings)
+    exec_bars_path = execution_bars_path(cfg) or cfg.input_dir / "daily_bars.parquet"
     panels = load_daily_price_panels(exec_bars_path, dates, tickers)
     return_panels = load_daily_price_panels(cfg.daily_bars_path, dates, tickers) if cfg.daily_bars_path is not None else panels
+    if "market_cap" not in panels:
+        raise ValueError("WRDS daily bars must contain historical market_cap for mandatory bottom-20% exclusion")
+    cap_mask = exclude_bottom_market_cap(panels["market_cap"], membership_mask)
+    tradable = np.asarray(tradable, dtype=bool) & pit_mask & cap_mask.to_numpy(dtype=bool)
+    pit_stats.update({
+        "membership_source": "compustat_wrds",
+        "universe": "NASDAQ",
+        "membership_observations": int(membership_mask.to_numpy(dtype=bool).sum()),
+        "market_cap_bottom_excluded_fraction": 0.2,
+        "eligible_after_market_cap": int(cap_mask.to_numpy(dtype=bool).sum()),
+        "delisting_recovery_fraction": DELISTING_RECOVERY_FRACTION,
+    })
     bars_start, bars_end = daily_bars_date_range(cfg.daily_bars_path)
     exec_bars_start, exec_bars_end = daily_bars_date_range(exec_bars_path)
     dollar_volume = None
     signal_price = None
     if {"close", "volume"}.issubset(panels):
-        signal_price = panels["close"].to_numpy(dtype=float)
-        dollar_volume = signal_price * panels["volume"].to_numpy(dtype=float)
+        signal_price = panels.get("raw_close", panels["close"]).to_numpy(dtype=float)
+        dollar_volume = panels["close"].to_numpy(dtype=float) * panels["volume"].to_numpy(dtype=float)
     alpha, contrib = compute_alpha_and_contributions(X, f_pred)
     weights, filter_info = build_daily_weights(alpha, tradable, dollar_volume, cfg, price=signal_price)
     realized, price_frame, price_warnings = compute_execution_returns(
@@ -940,12 +966,17 @@ def run_close_to_next_open_backtest(cfg: DailyBacktestConfig) -> DailyBacktestRe
         cfg,
         tickers=tickers,
         return_panels=return_panels,
+        ticker_metadata=ticker_metadata,
     )
     warnings.extend(price_warnings)
     first_non_executable = max(0, len(dates) - cfg.holding_period_days)
     if first_non_executable < weights.shape[0]:
         weights[first_non_executable:] = 0.0
-    weights, risk_controls = apply_dynamic_risk_controls(weights, realized, cfg)
+    # Ineligible, unfilled, and end-of-sample positions must remain zero after
+    # the risk layer applies its own turnover smoothing.
+    risk_eligible = tradable & np.isfinite(realized)
+    risk_eligible[first_non_executable:] = False
+    weights, risk_controls = apply_dynamic_risk_controls(weights, realized, cfg, eligible=risk_eligible)
     previous_weights = np.vstack([np.zeros((1, weights.shape[1])), weights[:-1]])
     returns, turnover, costs, turnover_penalty = portfolio_pnl(weights, realized, cfg)
     equity = np.cumprod(1.0 + np.where(np.isfinite(returns), returns, 0.0))

@@ -3,7 +3,23 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-FIELDS = ["open", "high", "low", "close", "adj_close", "volume", "vwap", "transactions"]
+FIELDS = ["open", "high", "low", "close", "adj_close", "volume", "vwap", "transactions", "market_cap", "raw_open", "raw_close", "raw_volume"]
+DELISTING_RECOVERY_FRACTION = 0.5
+
+
+def delisting_dates(ticker_metadata: pd.DataFrame | None, tickers: list[str]) -> pd.Series:
+    """Read confirmed security delistings, never infer one from a missing quote."""
+    result = pd.Series(pd.NaT, index=tickers, dtype="datetime64[ns]")
+    if ticker_metadata is None or ticker_metadata.empty or "delisted_utc" not in ticker_metadata:
+        return result
+    if "ticker" not in ticker_metadata:
+        raise ValueError("Delisting metadata must contain ticker")
+    meta = ticker_metadata.copy()
+    meta["ticker"] = meta["ticker"].astype(str)
+    if meta["ticker"].duplicated().any():
+        raise ValueError("Delisting metadata must have one row per security")
+    values = pd.to_datetime(meta.set_index("ticker")["delisted_utc"], errors="coerce", utc=True)
+    return values.dt.tz_convert(None).dt.normalize().reindex(tickers)
 
 
 def bars_long_to_panel(bars: pd.DataFrame, tickers: list[str] | None = None) -> dict[str, pd.DataFrame]:
@@ -66,12 +82,34 @@ def compute_forward_returns(
     adj_close: pd.DataFrame,
     horizon: int = 1,
     max_abs_return: float | None = None,
+    ticker_metadata: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    returns = adj_close.shift(-horizon) / adj_close - 1.0
+    if not isinstance(horizon, int) or horizon < 1:
+        raise ValueError("horizon must be a positive integer")
+    prices = adj_close.where(np.isfinite(adj_close) & adj_close.gt(0))
+    returns = prices.shift(-horizon) / prices - 1.0
+    settlements = pd.DataFrame(False, index=prices.index, columns=prices.columns)
+    dates = pd.DatetimeIndex(prices.index).normalize()
+    if not dates.is_monotonic_increasing or dates.has_duplicates:
+        raise ValueError("Price dates must be strictly increasing")
+    events = delisting_dates(ticker_metadata, list(prices.columns))
+    for ticker, event in events.dropna().items():
+        # All horizons crossing a known event settle once, even if stale quotes
+        # happen to remain in the source after the security ceased trading.
+        returns.loc[dates >= event, ticker] = np.nan
+        before = prices.loc[dates < event, ticker].dropna()
+        if before.empty:
+            continue
+        recovery = DELISTING_RECOVERY_FRACTION * float(before.iloc[-1])
+        if horizon < len(dates):
+            starts = np.flatnonzero((dates[:-horizon] < event) & (dates[horizon:] >= event))
+            column = prices.columns.get_loc(ticker)
+            returns.iloc[starts, column] = recovery / prices.iloc[starts, column] - 1.0
+            settlements.iloc[starts, column] = True
     if max_abs_return is not None:
         if max_abs_return <= 0:
             raise ValueError("max_abs_return must be positive")
-        returns = returns.mask(returns.abs() > max_abs_return)
+        returns = returns.mask((returns.abs() > max_abs_return) & ~settlements)
     return returns
 
 

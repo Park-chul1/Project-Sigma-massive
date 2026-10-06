@@ -6,6 +6,10 @@ import pandas as pd
 
 META_COLS = {
     "ticker",
+    "gvkey",
+    "iid",
+    "symbol",
+    "source",
     "start_date",
     "end_date",
     "filing_date",
@@ -181,11 +185,14 @@ def fundamentals_to_daily(flat: pd.DataFrame, dates: pd.DatetimeIndex, tickers: 
     return daily
 
 
-def build_fundamental_factors(fund: dict[str, pd.DataFrame], close: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def build_fundamental_factors(
+    fund: dict[str, pd.DataFrame], close: pd.DataFrame,
+    market_cap: pd.DataFrame | None = None,
+) -> dict[str, pd.DataFrame]:
     def g(name: str) -> pd.DataFrame:
         return fund.get(name, pd.DataFrame(index=close.index, columns=close.columns, dtype=float))
     shares = g("shares_diluted").where(np.isfinite(g("shares_diluted")), g("shares_basic"))
-    market_cap = close * shares
+    market_cap = close * shares if market_cap is None else market_cap.reindex_like(close)
     enterprise_value = market_cap + g("debt") - g("cash")
     f: dict[str, pd.DataFrame] = {}
     f["earnings_yield"] = g("net_income") / market_cap

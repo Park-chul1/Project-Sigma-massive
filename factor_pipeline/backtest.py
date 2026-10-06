@@ -29,6 +29,7 @@ def portfolio_returns(
     r: np.ndarray,
     min_return_coverage: float = 0.80,
     max_abs_return: float | None = 1.0,
+    terminal_return_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute daily portfolio returns from weights[t] and forward returns r[t].
 
@@ -41,10 +42,15 @@ def portfolio_returns(
     r = np.asarray(r, dtype=float)
     if weights.shape != r.shape:
         raise ValueError(f"weights shape {weights.shape} must equal r shape {r.shape}")
+    terminal = np.zeros(r.shape, dtype=bool)
+    if terminal_return_mask is not None:
+        terminal = np.asarray(terminal_return_mask, dtype=bool)
+        if terminal.shape != r.shape:
+            raise ValueError("terminal_return_mask must align with returns")
     if max_abs_return is not None:
         if max_abs_return <= 0:
             raise ValueError("max_abs_return must be positive")
-        r = np.where(np.abs(r) <= max_abs_return, r, np.nan)
+        r = np.where((np.abs(r) <= max_abs_return) | terminal, r, np.nan)
 
     T = weights.shape[0]
     port = np.full(T, np.nan, dtype=float)
@@ -121,6 +127,7 @@ def run_factor_backtest(
     min_names_per_side: int = 5,
     min_return_coverage: float = 0.80,
     max_abs_return: float | None = 1.0,
+    terminal_return_mask: np.ndarray | None = None,
 ) -> dict:
     f_pred = predict_factor_returns(
         f,
@@ -142,6 +149,7 @@ def run_factor_backtest(
         r,
         min_return_coverage=min_return_coverage,
         max_abs_return=max_abs_return,
+        terminal_return_mask=terminal_return_mask,
     )
     turnover = compute_turnover(weights)
     metrics = summarize_backtest(returns, weights, turnover)

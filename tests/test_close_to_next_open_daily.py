@@ -11,6 +11,7 @@ from backtests.close_to_next_open_daily import (
     REQUIRED_REPORT_FILES,
     apply_dynamic_risk_controls,
     _rank_weights_one_day,
+    compute_execution_returns,
     compute_alpha_and_contributions,
     portfolio_pnl,
     run_close_to_next_open_backtest,
@@ -38,7 +39,8 @@ def _write_fixture(tmp_path):
     np.save(input_dir / "r.npy", r)
     np.save(input_dir / "tradable_mask.npy", tradable)
     pd.DataFrame({"date": dates}).to_csv(input_dir / "dates.csv", index=False)
-    pd.DataFrame({"ticker": tickers}).to_csv(input_dir / "tickers.csv", index=False)
+    pd.DataFrame({"ticker": tickers, "source": "compustat_wrds", "list_date": dates[0], "delisted_utc": pd.NaT}).to_csv(input_dir / "tickers.csv", index=False)
+    pd.DataFrame({"ticker": tickers, "from_date": dates[0], "thru_date": pd.NaT, "source": "compustat_wrds"}).to_parquet(input_dir / "nasdaq_membership.parquet", index=False)
     pd.DataFrame({"factor": factors}).to_csv(input_dir / "factor_names.csv", index=False)
 
     rows = []
@@ -51,6 +53,8 @@ def _write_fixture(tmp_path):
                 "open": price,
                 "close": price + 0.5,
                 "volume": 1_000_000 + i,
+                "market_cap": (abs(i - 4.5) + 1) * 1_000_000_000,
+                "source": "compustat_wrds",
             })
     bars_path = tmp_path / "bars.parquet"
     pd.DataFrame(rows).to_parquet(bars_path, index=False)
@@ -246,9 +250,10 @@ def test_execution_bars_path_drives_min_price_filter(tmp_path):
 
 def test_missing_exit_price_raises_for_active_position(tmp_path):
     cfg = _cfg(tmp_path)
-    tickers = pd.read_csv(cfg.input_dir / "tickers.csv")
-    tickers["delisted_utc"] = np.where(tickers["ticker"].eq("T09"), "2024-01-05", "")
-    tickers.to_csv(cfg.input_dir / "tickers.csv", index=False)
+    membership_path = cfg.input_dir / "nasdaq_membership.parquet"
+    membership = pd.read_parquet(membership_path)
+    membership.loc[membership["ticker"].eq("T09"), "thru_date"] = pd.Timestamp("2024-01-04")
+    membership.to_parquet(membership_path, index=False)
     bars = pd.read_parquet(cfg.daily_bars_path)
     dates = sorted(pd.to_datetime(bars["date"]).dt.normalize().unique())
     bars.loc[
@@ -293,3 +298,103 @@ def test_kalman_diagnostic_columns_are_reported(tmp_path):
     result = run_close_to_next_open_backtest(cfg)
     cols = set(result.factor_forecast.columns)
     assert {"kalman_f_hat", "kalman_gain", "state_covariance_diag", "process_noise_q", "measurement_noise_r", "final_f_hat"}.issubset(cols)
+
+
+def test_legacy_source_and_missing_cap_are_rejected(tmp_path):
+    cfg = _cfg(tmp_path)
+    bars = pd.read_parquet(cfg.daily_bars_path)
+    bars.drop(columns=["market_cap"]).to_parquet(cfg.daily_bars_path, index=False)
+    with pytest.raises(ValueError, match="market_cap"):
+        run_close_to_next_open_backtest(cfg)
+    bars["source"] = "legacy"
+    bars.to_parquet(cfg.daily_bars_path, index=False)
+    with pytest.raises(ValueError, match="Compustat/WRDS"):
+        run_close_to_next_open_backtest(cfg)
+
+
+def test_membership_and_cap_exclusions_override_turnover_in_both_layers(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg = cfg.__class__(**{**cfg.__dict__, "turnover_cap": 0.1})
+    bars = pd.read_parquet(cfg.daily_bars_path)
+    # T09 becomes the smallest security after it has already been held.
+    bars.loc[(bars["date"] >= pd.Timestamp("2024-01-05")) & bars["ticker"].eq("T09"), "market_cap"] = 1.0
+    bars.to_parquet(cfg.daily_bars_path, index=False)
+    membership = pd.read_parquet(cfg.input_dir / "nasdaq_membership.parquet")
+    membership.loc[membership["ticker"].eq("T00"), "thru_date"] = pd.Timestamp("2024-01-04")
+    membership.to_parquet(cfg.input_dir / "nasdaq_membership.parquet", index=False)
+    result = run_close_to_next_open_backtest(cfg)
+    targets = result.target_positions
+    for ticker in ["T00", "T09"]:
+        selected = targets[targets["ticker"].eq(ticker)]
+        assert selected.loc[selected["signal_date"] < "2024-01-05", "target_weight"].abs().max() > 0
+        assert selected.loc[selected["signal_date"] >= "2024-01-05", "target_weight"].eq(0).all()
+
+
+def _delisting_fixture():
+    dates = pd.bdate_range("2024-01-02", periods=5)
+    # Recovery is based on the latest 80 close, not the 100 entry or stale 999.
+    panels = {
+        "open": pd.DataFrame({"A": [90.0, 100.0, 110.0, 999.0, 999.0]}, index=dates),
+        "close": pd.DataFrame({"A": [95.0, 120.0, 80.0, 999.0, 999.0]}, index=dates),
+    }
+    meta = pd.DataFrame({"ticker": ["A"], "delisted_utc": [dates[3]]})
+    return dates, panels, meta
+
+
+@pytest.mark.parametrize("weight,expected_pnl", [(1.0, -0.6), (-1.0, 0.6)])
+def test_confirmed_delisting_recovers_half_last_price_for_long_and_short(weight, expected_pnl):
+    dates, panels, meta = _delisting_fixture()
+    weights = np.zeros((len(dates), 1))
+    weights[0, 0] = weight
+    cfg = DailyBacktestConfig(holding_period_days=2, transaction_cost_bps=0, slippage_bps=0, max_abs_return=0.1)
+    realized, prices, warnings = compute_execution_returns(weights, dates, panels, None, cfg, ticker_metadata=meta)
+    assert realized[0, 0] == pytest.approx(-0.6)
+    assert prices.iloc[0]["exit_price"] == pytest.approx(40.0)
+    assert prices.iloc[0]["exit_date"] == dates[3]
+    assert any("50%" in warning for warning in warnings)
+    pnl, *_ = portfolio_pnl(weights, realized, cfg)
+    assert pnl[0] == pytest.approx(expected_pnl)
+
+
+def test_delisting_on_entry_prevents_purchase_even_with_stale_quote():
+    dates, panels, meta = _delisting_fixture()
+    meta["delisted_utc"] = dates[1]
+    weights = np.zeros((len(dates), 1))
+    weights[0, 0] = 1.0
+    realized, prices, _ = compute_execution_returns(weights, dates, panels, None, DailyBacktestConfig(), ticker_metadata=meta)
+    assert weights[0, 0] == 0
+    assert np.isnan(realized[0, 0])
+    assert np.isnan(prices.iloc[0]["execution_price"])
+
+
+def test_delisting_uses_adjusted_price_basis_and_falls_back_to_last_valid_quote():
+    dates, panels, meta = _delisting_fixture()
+    # No closing quote on the final trading day: its open is the last price.
+    panels["open"].iloc[2, 0] = 70.0
+    panels["close"].iloc[2, 0] = np.nan
+    panels["raw_open"] = panels["open"] * 2.0
+    panels["raw_close"] = panels["close"] * 2.0
+    panels["raw_open"].iloc[1, 0] = 1000.0  # Split basis differs at entry.
+    weights = np.zeros((len(dates), 1))
+    weights[0, 0] = 1.0
+    realized, prices, _ = compute_execution_returns(weights, dates, panels, None, DailyBacktestConfig(holding_period_days=2), ticker_metadata=meta)
+    assert realized[0, 0] == pytest.approx(35.0 / 100.0 - 1.0)
+    assert prices.iloc[0]["execution_price"] == 1000.0
+    assert prices.iloc[0]["exit_price"] == 70.0
+
+
+def test_an_ordinary_quote_gap_is_not_a_delisting():
+    dates, panels, _ = _delisting_fixture()
+    panels["open"].iloc[2, 0] = np.nan
+    weights = np.zeros((len(dates), 1))
+    weights[0, 0] = 1.0
+    with pytest.raises(RuntimeError, match="Missing exit price"):
+        compute_execution_returns(weights, dates, panels, None, DailyBacktestConfig())
+
+
+def test_zero_or_legacy_terminal_return_policy_cannot_be_enabled():
+    for policy in ["zero", "terminal_return"]:
+        with pytest.raises(ValueError, match="confirmed delistings"):
+            DailyBacktestConfig(missing_price_policy=policy).validate()
+    with pytest.raises(ValueError, match="mandatory"):
+        DailyBacktestConfig(use_point_in_time_universe=False).validate()

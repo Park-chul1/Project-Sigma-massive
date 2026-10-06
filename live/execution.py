@@ -10,7 +10,9 @@ from live.config import LiveConfig
 def latest_prices_from_bars(bars: pd.DataFrame) -> pd.Series:
     if bars.empty:
         return pd.Series(dtype=float)
-    return bars.drop_duplicates("ticker", keep="last").set_index("ticker")["close"].astype(float)
+    if "raw_close" not in bars:
+        raise ValueError("Broker share sizing requires Compustat raw_close; adjusted close is not an execution price")
+    return bars.drop_duplicates("ticker", keep="last").set_index("ticker")["raw_close"].astype(float)
 
 
 def current_weights_from_positions(positions: pd.Series, prices: pd.Series, equity: float) -> pd.Series:

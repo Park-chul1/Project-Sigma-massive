@@ -47,11 +47,6 @@ def parse_args():
     p.add_argument("--allow-stale-signals", action="store_true", help="Allow live orders even when the selected pipeline date is stale")
     p.add_argument("--dry-run", action="store_true", help="Do not send live orders; only print order plan")
     p.add_argument("--auto-rebalance", action="store_true", help="Place live orders to rebalance current positions toward target weights")
-    p.add_argument("--stream-interval", type=float, default=30.0, help="Seconds between live market data refreshes")
-    p.add_argument("--stream-duration-minutes", type=float, default=10.0, help="How many minutes to stream live market data")
-    p.add_argument("--rebalance-interval-minutes", type=float, default=0.0, help="If >0, repeat rebalance every N minutes while streaming")
-    p.add_argument("--market-data-type", type=int, default=1, help="IB market data type: 1 realtime, 2 frozen, 3 delayed, 4 delayed frozen")
-    p.add_argument("--symbols", nargs="*", default=[], help="Additional symbols to stream for market data")
     p.add_argument("--pnl-log", default="data/ibkr_daily_pnl.csv", help="CSV file path for daily PnL and equity snapshots")
     return p.parse_args()
 
@@ -64,14 +59,6 @@ def connect_ibkr(host: str, port: int, client_id: int, timeout: float = 10.0) ->
 
 def stock_contract(symbol: str, exchange: str = "SMART", currency: str = "USD") -> Stock:
     return Stock(symbol, exchange, currency)
-
-
-def set_market_data_type(ib: IB, market_data_type: int = 1) -> None:
-    if hasattr(ib, "reqMarketDataType"):
-        try:
-            ib.reqMarketDataType(market_data_type)
-        except Exception as exc:
-            print(f"WARN: failed to set market data type {market_data_type}: {exc}")
 
 
 def account_values(ib: IB, account: str | None = None) -> list:
@@ -105,118 +92,7 @@ def positions_by_symbol(ib: IB, account: str | None = None) -> dict[str, int]:
     return out
 
 
-def get_latest_prices(ib: IB, symbols: list[str], timeout: float = 2.0, market_data_type: int = 1) -> dict[str, float | None]:
-    set_market_data_type(ib, market_data_type)
-    prices: dict[str, float | None] = {}
-    tickers = []
-    for symbol in symbols:
-        contract = stock_contract(symbol)
-        ticker = ib.reqMktData(contract, snapshot=True)
-        tickers.append((symbol, ticker))
-
-    elapsed = 0.0
-    while elapsed < timeout:
-        all_updated = True
-        for _, ticker in tickers:
-            if not math.isfinite(getattr(ticker, 'last', float('nan'))):
-                all_updated = False
-                break
-        if all_updated:
-            break
-        ib.sleep(0.05)
-        elapsed += 0.05
-
-    for symbol, ticker in tickers:
-        price = getattr(ticker, "last", float("nan"))
-        if not math.isfinite(price):
-            price = getattr(ticker, "close", float("nan"))
-        prices[symbol] = float(price) if math.isfinite(price) else None
-    for _, ticker in tickers:
-        ib.cancelMktData(ticker)
-    return prices
-
-
-def load_pipeline_target_weights(
-    path: Path,
-    date_index: int = -1,
-    method: str = "ewma",
-    lookback: int = 20,
-    ewma_halflife: float = 20.0,
-    min_periods: int = 5,
-    quantile: float = 0.10,
-    gross: float = 2.0,
-) -> tuple[list[str], np.ndarray]:
-    tickers_path = path / "tickers.csv"
-    if not tickers_path.exists():
-        raise FileNotFoundError(f"Pipeline output missing tickers.csv in {path}")
-    tickers = pd.read_csv(tickers_path, usecols=["ticker"]).squeeze("columns").astype(str).tolist()
-
-    weights_path = path / "weights.npy"
-    positions_path = path / "positions.npy"
-    scores_path = path / "scores.npy"
-
-    if weights_path.exists() or positions_path.exists() or scores_path.exists():
-        if weights_path.exists():
-            weights = np.load(weights_path)
-        elif positions_path.exists():
-            weights = np.load(positions_path)
-        else:
-            scores = np.load(scores_path)
-            if scores.ndim != 2:
-                raise ValueError(f"scores.npy must be 2-D [T,N], got {scores.shape}")
-            if date_index < 0:
-                date_index = scores.shape[0] + date_index
-            if not (0 <= date_index < scores.shape[0]):
-                raise IndexError(f"date_index {date_index} out of range for scores shape {scores.shape}")
-            return tickers, scores[date_index]
-
-        if weights.ndim != 2:
-            raise ValueError(f"weight array must be 2-D [T,N], got {weights.shape}")
-        if date_index < 0:
-            date_index = weights.shape[0] + date_index
-        if not (0 <= date_index < weights.shape[0]):
-            raise IndexError(f"date_index {date_index} out of range for weight array shape {weights.shape}")
-        return tickers, weights[date_index]
-
-    X_path = path / "X.npy"
-    f_path = path / "factor_returns.npy"
-    if not X_path.exists() or not f_path.exists():
-        raise FileNotFoundError(
-            f"Pipeline output missing tickers.csv and no weights.npy/positions.npy/scores.npy, nor X.npy/factor_returns.npy in {path}"
-        )
-
-    X = np.load(X_path)
-    f = np.load(f_path)
-    tradable_mask_path = path / "tradable_mask.npy"
-    tradable_mask = np.load(tradable_mask_path) if tradable_mask_path.exists() else None
-
-    from factor_pipeline.signals import (
-        make_quantile_long_short_weights,
-        make_scores,
-        predict_factor_returns,
-    )
-
-    f_pred = predict_factor_returns(
-        f,
-        method=method,
-        lookback=lookback,
-        ewma_halflife=ewma_halflife,
-        min_periods=min_periods,
-    )
-
-    if date_index < 0:
-        date_index = f_pred.shape[0] + date_index
-    if not (0 <= date_index < f_pred.shape[0]):
-        raise IndexError(f"date_index {date_index} out of range for factor predictions shape {f_pred.shape}")
-
-    scores = make_scores(X, f_pred, tradable_mask=tradable_mask)
-    weights = make_quantile_long_short_weights(
-        scores[date_index],
-        tradable_mask[date_index] if tradable_mask is not None else None,
-        quantile=quantile,
-        gross=gross,
-    )
-    return tickers, weights
+from factor_pipeline.saved_targets import load_pipeline_target_weights, load_wrds_closing_prices
 
 
 def pipeline_signal_date(path: Path, date_index: int = -1) -> datetime.date | None:
@@ -321,33 +197,6 @@ def write_daily_pnl(path: Path, account: str | None, equity: float, cash: float 
         writer.writerow(row)
 
 
-def run_live_stream(ib: IB, symbols: list[str], interval: float, duration_minutes: float, market_data_type: int = 1) -> None:
-    if not symbols:
-        print("No symbols provided for live streaming")
-        return
-    set_market_data_type(ib, market_data_type)
-    print(f"Starting live market data stream for {len(symbols)} symbols (market_data_type={market_data_type})")
-    contracts = [stock_contract(symbol) for symbol in symbols]
-    tickers = [ib.reqMktData(contract, snapshot=False) for contract in contracts]
-    try:
-        loops = max(1, int(duration_minutes * 60 / max(interval, 1.0)))
-        for i in range(loops):
-            ib.sleep(interval)
-            print(f"--- market snapshot {i + 1}/{loops} ---")
-            for symbol, ticker in zip(symbols, tickers):
-                last = getattr(ticker, "last", float("nan"))
-                bid = getattr(ticker, "bid", float("nan"))
-                ask = getattr(ticker, "ask", float("nan"))
-                print(
-                    f"{symbol}: last={last if math.isfinite(last) else 'NA'}"
-                    f", bid={bid if math.isfinite(bid) else 'NA'}"
-                    f", ask={ask if math.isfinite(ask) else 'NA'}"
-                )
-    finally:
-        for ticker in tickers:
-            ib.cancelMktData(ticker)
-
-
 def rebalance_portfolio(
     ib: IB,
     tickers: list[str],
@@ -359,7 +208,8 @@ def rebalance_portfolio(
     top_n: int,
     dry_run: bool,
     auto_rebalance: bool,
-    market_data_type: int = 1,
+    pipeline_path: Path,
+    date_index: int = -1,
 ) -> tuple[list[str], dict[str, int], dict[str, int], dict[str, int]]:
     target_dollars_raw = compute_target_dollars(weights, equity)
     target_weights = {
@@ -371,8 +221,8 @@ def rebalance_portfolio(
     print(f"Selected {len(limited)} symbols after risk limits")
 
     live_symbols = list(limited.keys())
-    prices = get_latest_prices(ib, live_symbols, market_data_type=market_data_type)
-    print("--- live prices ---")
+    prices = load_wrds_closing_prices(pipeline_path, live_symbols, date_index)
+    print("--- WRDS signal-date raw closes ---")
     for symbol in live_symbols:
         print(f"{symbol}: {prices.get(symbol)}")
 
@@ -465,29 +315,12 @@ def main():
             top_n=args.top_n,
             dry_run=args.dry_run,
             auto_rebalance=args.auto_rebalance,
-            market_data_type=args.market_data_type,
+            pipeline_path=pipeline_path,
+            date_index=args.date_index,
         )
-        if args.symbols:
-            stream_symbols = sorted(set(stream_symbols) | set(args.symbols))
-    elif args.symbols:
-        stream_symbols = args.symbols
-        prices = get_latest_prices(ib, stream_symbols)
-        print("--- live prices ---")
-        for symbol, price in prices.items():
-            print(f"{symbol}: {price}")
-
     if args.pnl_log and equity is not None:
         write_daily_pnl(Path(args.pnl_log), args.account, equity, cash)
         print(f"Appended daily PnL snapshot to {args.pnl_log}")
-
-    if stream_symbols:
-        run_live_stream(
-            ib,
-            stream_symbols,
-            args.stream_interval,
-            args.stream_duration_minutes,
-            market_data_type=args.market_data_type,
-        )
 
     ib.disconnect()
     print("disconnected")

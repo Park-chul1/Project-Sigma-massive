@@ -13,7 +13,7 @@ if [ $? -eq 0 ]; then
     
     # Run portfolio rebalancing
     echo "$(date): Running portfolio rebalancing..." >> logs/auto_pipeline.log
-    python scripts/ibkr_live_portfolio.py --load-pipeline data/processed --host 172.30.1.41 --port 7497 --auto-rebalance --date-index -1 --method ewma --lookback 20 --ewma-halflife 20.0 --quantile 0.10 --gross 2.0 --notional 5000.0 --top-n 10 --max-symbol-pct 0.05 --max-side-pct 0.80 --market-data-type 3 --stream-duration-minutes 1.0 >> logs/auto_pipeline.log 2>&1
+    python scripts/ibkr_live_portfolio.py --load-pipeline data/processed --host 172.30.1.41 --port 7497 --auto-rebalance --date-index -1 --method ewma --lookback 20 --ewma-halflife 20.0 --quantile 0.10 --gross 2.0 --notional 5000.0 --top-n 10 --max-symbol-pct 0.05 --max-side-pct 0.80 >> logs/auto_pipeline.log 2>&1
     
     if [ $? -eq 0 ]; then
         echo "$(date): Portfolio rebalancing completed successfully" >> logs/auto_pipeline.log

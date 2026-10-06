@@ -52,3 +52,51 @@ def test_build_tradable_mask_requires_positive_price_and_volume():
 
     expected = pd.DataFrame({"A": [True, False], "B": [True, False]}, index=idx)
     pd.testing.assert_frame_equal(mask, expected)
+
+
+def test_forward_delisting_recovery_uses_last_valid_price_within_horizon():
+    idx = pd.bdate_range("2024-01-01", periods=5)
+    close = pd.DataFrame({"A": [100.0, 120.0, 80.0, 999.0, 999.0]}, index=idx)
+    metadata = pd.DataFrame({"ticker": ["A"], "delisted_utc": [idx[3]]})
+    result = compute_forward_returns(close, horizon=3, ticker_metadata=metadata)
+    assert abs(result.iloc[0, 0] - (-0.6)) < 1e-12
+    assert abs(result.iloc[1, 0] - (40.0 / 120.0 - 1.0)) < 1e-12
+    assert result.iloc[2:, 0].isna().all()  # No observed full horizon at the end.
+    one_day = compute_forward_returns(close, ticker_metadata=metadata, max_abs_return=0.1)
+    assert abs(one_day.iloc[2, 0] - (-0.5)) < 1e-12
+    assert one_day.iloc[3:, 0].isna().all()  # Never repeat settlement.
+
+
+def test_forward_returns_do_not_guess_delisting_from_missing_quotes():
+    idx = pd.bdate_range("2024-01-01", periods=4)
+    close = pd.DataFrame({"A": [100.0, 120.0, None, None]}, index=idx)
+    result = compute_forward_returns(close)
+    assert result.iloc[1:, 0].isna().all()
+    metadata = pd.DataFrame({"ticker": ["A"], "delisted_utc": [idx[2]]})
+    recovered = compute_forward_returns(close, ticker_metadata=metadata)
+    assert recovered.iloc[1, 0] == -0.5
+
+
+def test_confirmed_terminal_returns_survive_research_outlier_filter():
+    weights = pd.DataFrame([[0.5, -0.5]]).to_numpy(dtype=float)
+    returns = pd.DataFrame([[-0.5, -0.5]]).to_numpy(dtype=float)
+    terminal = pd.DataFrame([[True, True]]).to_numpy(dtype=bool)
+    port, coverage = portfolio_returns(weights, returns, max_abs_return=0.1, terminal_return_mask=terminal)
+    assert coverage[0] == 1.0
+    assert port[0] == 0.0
+    ordinary_port, ordinary_coverage = portfolio_returns(weights, returns, max_abs_return=0.1)
+    assert ordinary_coverage[0] == 0.0
+    assert pd.isna(ordinary_port[0])
+
+
+def test_terminal_return_mask_rejects_wrong_shape_and_cannot_fill_missing_price():
+    import numpy as np
+    import pytest
+
+    weights = np.array([[1.0]])
+    returns = np.array([[np.nan]])
+    with pytest.raises(ValueError, match="terminal_return_mask"):
+        portfolio_returns(weights, returns, terminal_return_mask=np.zeros((2, 1), dtype=bool))
+    port, coverage = portfolio_returns(weights, returns, terminal_return_mask=np.ones((1, 1), dtype=bool))
+    assert coverage[0] == 0.0
+    assert np.isnan(port[0])

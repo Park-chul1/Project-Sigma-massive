@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from factor_pipeline.estimation import estimate_factor_returns
+from factor_pipeline.universe import load_wrds_universe_mask
 from factors.kalman_filter import kalman_filter_factor_returns_from_ols
 from factors.regime_sensor import classify_regime
 from factors.blend import blend_factor_returns
@@ -27,6 +28,10 @@ def load_pipeline_data(out_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarra
     dates = pd.to_datetime(dates_df["date"]).to_numpy()
     tickers_df = pd.read_csv(out_dir / "tickers.csv")
     tickers = tickers_df["ticker"].tolist()
+    policy_mask = load_wrds_universe_mask(out_dir, pd.DatetimeIndex(dates), tickers).to_numpy(dtype=bool)
+    saved_mask = np.load(out_dir / "tradable_mask.npy")
+    if saved_mask.shape != policy_mask.shape or (saved_mask & ~policy_mask).any():
+        raise ValueError("Input tradable mask violates the WRDS NASDAQ market-cap policy; rebuild inputs")
     factor_names_df = pd.read_csv(out_dir / "factor_names.csv")
     factor_names = factor_names_df["factor"].tolist()
     return X, r, f_ols, dates, tickers, factor_names
@@ -57,8 +62,8 @@ def save_regime_thresholds(out_dir: Path, dates: np.ndarray, warning_threshold: 
 
 def main():
     parser = argparse.ArgumentParser(description="Dynamic factor estimation pipeline")
-    parser.add_argument("--input-dir", default="data/processed_clean", help="Input directory with clean pipeline data")
-    parser.add_argument("--output-dir", default="data/processed", help="Output directory for dynamic results")
+    parser.add_argument("--input-dir", default="data/processed_wrds", help="Input directory with WRDS pipeline data")
+    parser.add_argument("--output-dir", default="data/processed_dynamic_wrds", help="Output directory for dynamic results")
     parser.add_argument("--q-scale", type=float, default=1e-4, help="Kalman process noise scale")
     parser.add_argument("--r-scale", type=float, default=1e-2, help="Kalman measurement noise scale")
     parser.add_argument("--p0-scale", type=float, default=1.0, help="Kalman initial covariance scale")
@@ -126,9 +131,16 @@ def main():
     np.save(output_dir / "X.npy", X)
     np.save(output_dir / "factor_returns.npy", f_blend)  # Use blended returns for portfolio
     np.save(output_dir / "r.npy", r)
+    for name in ("weights.npy", "positions.npy", "scores.npy", "f_pred.npy"):
+        (output_dir / name).unlink(missing_ok=True)
 
     # Copy static files from the selected input directory.
     import shutil
+    for name in ("nasdaq_membership.parquet", "daily_bars.parquet", "pipeline_summary.json", "terminal_return_mask.npy"):
+        source = input_dir / name
+        destination = output_dir / name
+        if source.resolve() != destination.resolve():
+            shutil.copy(source, destination)
     shutil.copy(input_dir / "tickers.csv", output_dir / "tickers.csv")
     shutil.copy(input_dir / "factor_names.csv", output_dir / "factor_names.csv")
     dates_path = input_dir / "dates.csv"

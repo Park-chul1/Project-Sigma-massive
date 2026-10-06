@@ -20,7 +20,6 @@ def main() -> None:
     p.add_argument("--account", default=None)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--max-orders", type=int, default=None)
-    p.add_argument("--use-live-prices", action="store_true", help="Request IBKR snapshots before falling back to report signal prices")
     p.add_argument("--transaction-cost-bps", type=float, default=1.0)
     p.add_argument("--slippage-bps", type=float, default=2.0)
     p.add_argument("--min-net-alpha-after-cost-bps", type=float, default=5.0)
@@ -38,7 +37,6 @@ def main() -> None:
             account=args.account,
             dry_run=args.dry_run,
             max_orders=args.max_orders,
-            use_live_prices=args.use_live_prices,
             transaction_cost_bps=args.transaction_cost_bps,
             slippage_bps=args.slippage_bps,
             min_net_alpha_after_cost_bps=args.min_net_alpha_after_cost_bps,

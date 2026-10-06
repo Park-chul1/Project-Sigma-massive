@@ -8,11 +8,11 @@ import os
 
 @dataclass(frozen=True)
 class LiveConfig:
-    DATA_PROVIDER: str = "massive"
-    DELAY_MINUTES: int = 15
-    BAR_INTERVAL: str = "15m"
-    POLL_INTERVAL_SECONDS: int = 300
-    UNIVERSE_SIZE_LIMIT: int | None = 500
+    DATA_PROVIDER: str = "wrds"
+    DELAY_MINUTES: int = 0
+    BAR_INTERVAL: str = "1d"
+    POLL_INTERVAL_SECONDS: int = 86400
+    UNIVERSE_SIZE_LIMIT: int | None = None
     MIN_DOLLAR_VOLUME: float = 1_000_000.0
     MAX_POSITION_WEIGHT: float = 0.02
     MAX_GROSS_EXPOSURE: float = 1.0
@@ -29,18 +29,12 @@ class LiveConfig:
     IBKR_HOST: str = "172.30.1.41"
     IBKR_PORT: int = 7497
     IBKR_CLIENT_ID: int = 71
-    IBKR_DATA_CLIENT_ID: int = 71
     IBKR_BROKER_CLIENT_ID: int = 72
     IBKR_ACCOUNT: str | None = None
-    IBKR_MARKET_DATA_TYPE: int = 3
-    IBKR_HISTORY_DURATION: str = "5 D"
-    IBKR_WHAT_TO_SHOW: str = "TRADES"
-    IBKR_USE_RTH: bool = True
-    LIVE_FETCH_BATCH_SIZE: int = 50
-    LIVE_FETCH_WORKERS: int = 1
-    MASSIVE_PREFETCH_DAYS: int = 5
-    MASSIVE_REQUEST_SLEEP_SECONDS: float = 0.02
-    IBKR_REQUEST_SLEEP_SECONDS: float = 0.05
+    WRDS_USERNAME: str | None = None
+    WRDS_CACHE_PATH: Path = Path("data/wrds_api_cache")
+    WRDS_PREFETCH_DAYS: int = 400
+    MEMBERSHIP_PATH: Path = Path("data/processed_wrds/nasdaq_membership.parquet")
     LONG_SHORT: bool = True
     DRY_RUN: bool = False
     LOOKBACK_BARS: int = 260
@@ -48,20 +42,21 @@ class LiveConfig:
     MIN_EXPOSURE_COVERAGE: float = 0.70
     MIN_ORDER_DOLLARS: float = 100.0
     MARKET_TIMEZONE: str = "America/New_York"
-    CACHE_PATH: Path = Path("data/live_cache/bars.parquet")
-    UNIVERSE_PATH: Path = Path("data/cache_clean/tickers_XNAS_all.parquet")
-    LIVE_ACTIVE_ONLY: bool = True
-    UNIVERSE_RANK_BY: str = "dollar_volume"
-    UNIVERSE_RANK_LOOKBACK_BARS: int = 20
-    UNIVERSE_BARS_PATH: Path = Path("data/cache_daily_latest/grouped_daily.parquet")
-    FACTOR_PRED_PATH: Path = Path("data/processed_daily_latest/factor_returns.npy")
-    FACTOR_NAMES_PATH: Path = Path("data/processed_daily_latest/factor_names.csv")
+    CACHE_PATH: Path = Path("data/live_wrds/bars.parquet")
+    UNIVERSE_PATH: Path = Path("data/processed_wrds/tickers.csv")
+    UNIVERSE_BARS_PATH: Path = Path("data/processed_wrds/daily_bars.parquet")
+    FACTOR_PRED_PATH: Path = Path("data/processed_wrds/factor_returns.npy")
+    FACTOR_NAMES_PATH: Path = Path("data/processed_wrds/factor_names.csv")
     LOG_DIR: Path = Path("logs")
     PAPER_STARTING_EQUITY: float = 100_000.0
 
     def validate(self) -> None:
-        if self.DELAY_MINUTES < 15:
-            raise ValueError("DELAY_MINUTES must be at least 15 for delayed-data mode")
+        if self.DATA_PROVIDER.lower() not in {"wrds", "cache"}:
+            raise ValueError("DATA_PROVIDER must be wrds or cache; all market data must originate in Compustat WRDS")
+        if self.BAR_INTERVAL != "1d":
+            raise ValueError("Compustat WRDS supplies daily bars only; intraday market data is unsupported")
+        if self.DELAY_MINUTES != 0:
+            raise ValueError("Minute-delay settings are unsupported for Compustat WRDS daily data")
         if self.PAPER_TRADING and self.ENABLE_REAL_TRADING:
             raise ValueError("PAPER_TRADING and ENABLE_REAL_TRADING cannot both be true")
         if not self.PAPER_TRADING and not self.ENABLE_REAL_TRADING:
@@ -90,7 +85,7 @@ def load_config(path: str | Path | None = None) -> LiveConfig:
     unknown = set(raw) - names
     if unknown:
         raise ValueError(f"Unknown live config keys: {sorted(unknown)}")
-    path_fields = {"CACHE_PATH", "UNIVERSE_PATH", "UNIVERSE_BARS_PATH", "FACTOR_PRED_PATH", "FACTOR_NAMES_PATH", "LOG_DIR"}
+    path_fields = {"CACHE_PATH", "UNIVERSE_PATH", "UNIVERSE_BARS_PATH", "FACTOR_PRED_PATH", "FACTOR_NAMES_PATH", "LOG_DIR", "WRDS_CACHE_PATH", "MEMBERSHIP_PATH"}
     for name in path_fields & set(raw):
         raw[name] = Path(raw[name])
     cfg = LiveConfig(**raw)

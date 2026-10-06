@@ -18,6 +18,8 @@ from backtests.close_to_next_open_daily import (
 )
 from factor_pipeline.simple_config import load_config_dict
 from factor_pipeline.signals import predict_factor_returns
+from factor_pipeline.panel import delisting_dates
+from factor_pipeline.universe import load_wrds_universe_mask, validate_wrds_source
 
 
 def load_daily_job_config(path: str | Path | None) -> DailyBacktestConfig:
@@ -70,7 +72,10 @@ def _assert_signal_date_available(cfg: DailyBacktestConfig, signal_date: pd.Time
 def _load_static_inputs(cfg: DailyBacktestConfig) -> dict:
     input_dir = Path(cfg.input_dir)
     dates = pd.DatetimeIndex(pd.to_datetime(pd.read_csv(input_dir / "dates.csv")["date"]).dt.normalize())
-    tickers_df = pd.read_csv(input_dir / "tickers.csv")
+    tickers_df = pd.read_csv(input_dir / "tickers.csv", dtype={"ticker": str, "symbol": str})
+    validate_wrds_source(tickers_df, "daily report security metadata")
+    if not {"symbol", "delisted_utc"}.issubset(tickers_df):
+        raise ValueError("WRDS security metadata must include broker symbols and delisted_utc")
     ticker_col = "ticker" if "ticker" in tickers_df.columns else tickers_df.columns[0]
     tickers = tickers_df[ticker_col].astype(str).tolist()
     factor_df = pd.read_csv(input_dir / "factor_names.csv")
@@ -87,28 +92,20 @@ def _load_static_inputs(cfg: DailyBacktestConfig) -> dict:
         "tickers": tickers,
         "factor_names": factor_names,
         "company_names": company_names,
+        "symbols": tickers_df.set_index(ticker_col)["symbol"].to_dict(),
+        "delisting_dates": delisting_dates(tickers_df, tickers),
     }
 
 
 def _load_signal_bars(path: Path, signal_date: pd.Timestamp, tickers: list[str]) -> pd.DataFrame:
-    columns = ["date", "ticker", "open", "close", "volume", "vwap"]
-    try:
-        bars = pd.read_parquet(
-            path,
-            columns=[c for c in columns if c],
-            filters=[("date", "==", signal_date.to_pydatetime())],
-        )
-    except Exception:
-        bars = pd.DataFrame()
-    if bars.empty:
-        bars = pd.read_parquet(path, columns=[c for c in columns if c])
-        bars["date"] = pd.to_datetime(bars["date"]).dt.normalize()
-        bars = bars[bars["date"].eq(signal_date)].copy()
-    if bars.empty:
-        return pd.DataFrame(index=tickers)
+    bars = pd.read_parquet(path)
+    validate_wrds_source(bars, "daily report bars")
+    if "raw_close" not in bars:
+        raise ValueError("WRDS bars require raw_close for broker sizing and price filters")
+    bars["date"] = pd.to_datetime(bars["date"]).dt.normalize()
+    bars = bars[bars["date"].eq(signal_date)].copy()
     bars["ticker"] = bars["ticker"].astype(str)
-    bars = bars.drop_duplicates("ticker", keep="last").set_index("ticker")
-    return bars.reindex(tickers)
+    return bars.drop_duplicates("ticker", keep="last").set_index("ticker").reindex(tickers)
 
 
 def _signal_quantile_buckets(alpha: np.ndarray) -> dict[int, float]:
@@ -384,6 +381,15 @@ def run_after_close_signal_once(date: str | pd.Timestamp, cfg: DailyBacktestConf
     f = np.load(input_dir / "factor_returns.npy")
     r = np.load(input_dir / "r.npy", mmap_mode="r") if (input_dir / "r.npy").exists() else None
     tradable = np.load(input_dir / "tradable_mask.npy", mmap_mode="r")
+    if tradable.shape != (len(dates), len(tickers)):
+        raise ValueError("tradable_mask.npy shape does not match dates.csv and tickers.csv")
+    if X.shape != (len(dates), len(tickers), len(factor_names)) or f.shape != (len(dates), len(factor_names)):
+        raise ValueError("Factor arrays are not aligned to processed dates, securities, and factor names")
+    universe = load_wrds_universe_mask(input_dir, dates, tickers).to_numpy(dtype=bool)
+    tradable = np.asarray(tradable, dtype=bool) & universe
+    for i, end in enumerate(static["delisting_dates"]):
+        if pd.notna(end):
+            tradable[dates >= end, i] = False
     market_bars_path = execution_bars_path(cfg)
     if market_bars_path is None:
         raise RuntimeError("After-close job requires daily_bars_path or execution_bars_path for price and liquidity filters.")
@@ -397,9 +403,10 @@ def run_after_close_signal_once(date: str | pd.Timestamp, cfg: DailyBacktestConf
     f_hat = f_pred[t]
     X_t = np.asarray(X[t], dtype=float)
     bars = _load_signal_bars(Path(market_bars_path), signal_date, tickers)
-    close = pd.to_numeric(bars.get("close", pd.Series(index=tickers, dtype=float)), errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(bars.get("raw_close", pd.Series(index=tickers, dtype=float)), errors="coerce").to_numpy(dtype=float)
+    adjusted_close = pd.to_numeric(bars.get("close", pd.Series(index=tickers, dtype=float)), errors="coerce").to_numpy(dtype=float)
     volume = pd.to_numeric(bars.get("volume", pd.Series(index=tickers, dtype=float)), errors="coerce").to_numpy(dtype=float)
-    dollar_volume = close * volume
+    dollar_volume = adjusted_close * volume
     alpha = np.where(np.isfinite(X_t), X_t, 0.0) @ np.where(np.isfinite(f_hat), f_hat, 0.0)
     if not np.isfinite(f_hat).any():
         alpha[:] = np.nan
@@ -420,7 +427,7 @@ def run_after_close_signal_once(date: str | pd.Timestamp, cfg: DailyBacktestConf
             * pd.to_numeric(prev_bars.get("volume", pd.Series(index=tickers, dtype=float)), errors="coerce").to_numpy(dtype=float)
         )
         prev_close = pd.to_numeric(
-            prev_bars.get("close", pd.Series(index=tickers, dtype=float)),
+            prev_bars.get("raw_close", pd.Series(index=tickers, dtype=float)),
             errors="coerce",
         ).to_numpy(dtype=float)
         current, _ = _rank_weights_one_day(
@@ -436,6 +443,7 @@ def run_after_close_signal_once(date: str | pd.Timestamp, cfg: DailyBacktestConf
         turnover = 0.5 * float(np.abs(target - current).sum())
         if turnover > cfg.turnover_cap and turnover > 0:
             target = current + (target - current) * (cfg.turnover_cap / turnover)
+    target[~np.asarray(tradable[t], dtype=bool)] = 0.0
     if cfg.min_price > 0:
         price_ok = np.isfinite(close) & (close >= cfg.min_price)
         target[~price_ok] = 0.0
@@ -455,13 +463,16 @@ def run_after_close_signal_once(date: str | pd.Timestamp, cfg: DailyBacktestConf
         cfg,
     )
     alpha_rankings["signal_price"] = close
+    alpha_rankings["raw_signal_price"] = close
+    alpha_rankings["symbol"] = alpha_rankings["ticker"].map(static["symbols"])
+    alpha_rankings["source"] = "compustat_wrds"
     alpha_rankings["execution_date"] = execution_date
     alpha_rankings["execution_price"] = np.nan
     alpha_rankings["exit_date"] = pd.NaT
     alpha_rankings["exit_price"] = np.nan
     alpha_rankings["holding_period_days"] = cfg.holding_period_days
     target_positions = alpha_rankings[[
-        "signal_date", "ticker", "target_weight", "current_weight", "order_weight_delta",
+        "signal_date", "ticker", "symbol", "source", "target_weight", "current_weight", "order_weight_delta",
         "alpha_score", "trading_cost_bps", "net_alpha_after_cost_bps",
         "min_net_alpha_after_cost_bps", "passes_cost_threshold",
         "alpha_rank", "quantile_bucket", "price_flag", "reason_text",
@@ -547,7 +558,7 @@ def run_after_close_signal_once(date: str | pd.Timestamp, cfg: DailyBacktestConf
         "liquidity_warnings": [],
     }
     finite_by_factor = np.isfinite(X_t).mean(axis=0)
-    warnings = ["Historical universe is from saved processed files; verify point-in-time membership before relying on historical comparisons."]
+    warnings = []
     bars_start, bars_end = daily_bars_date_range(cfg.daily_bars_path)
     exec_bars_start, exec_bars_end = daily_bars_date_range(market_bars_path)
     metadata = {
@@ -571,7 +582,9 @@ def run_after_close_signal_once(date: str | pd.Timestamp, cfg: DailyBacktestConf
             "execution_bars_path": str(market_bars_path),
             "reports_dir": str(cfg.reports_dir),
         },
-        "data_source": str(market_bars_path),
+        "data_source": "compustat_wrds",
+        "universe": "historical_nasdaq_exchg_14",
+        "exclude_bottom_market_cap_fraction": 0.20,
         "input_files": {
             "input_dir": str(cfg.input_dir),
             "daily_bars_path": str(cfg.daily_bars_path),

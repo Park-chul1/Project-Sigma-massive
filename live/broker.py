@@ -80,11 +80,12 @@ class IBKRPaperBroker:
         self.config = config
         self.ib = IB()
         self.ib.connect(config.IBKR_HOST, config.IBKR_PORT, clientId=config.IBKR_BROKER_CLIENT_ID, timeout=10)
-        self.ib.reqMarketDataType(3)
 
     def _stock(self, ticker: str):
         from ib_insync import Stock
 
+        if "_" in ticker:
+            raise ValueError("Broker orders require a resolved trading symbol, not a Compustat security identifier")
         return Stock(ticker, "SMART", "USD")
 
     def _min_tick(self, contract) -> float:
@@ -132,48 +133,6 @@ class IBKRPaperBroker:
                 out["cash"] = float(value.value)
         out.setdefault("equity", self.config.PAPER_STARTING_EQUITY)
         return out
-
-    def get_prices(self, symbols: list[str], timeout: float = 3.0) -> pd.Series:
-        prices: dict[str, float] = {}
-        tickers = []
-        for symbol in symbols:
-            try:
-                contracts = self.ib.qualifyContracts(self._stock(symbol))
-                if not contracts:
-                    continue
-                ticker = self.ib.reqMktData(contracts[0], snapshot=True)
-                tickers.append((symbol, ticker))
-            except Exception as exc:
-                logging.warning("IBKR price snapshot request failed ticker=%s error=%s", symbol, exc)
-
-        elapsed = 0.0
-        while elapsed < timeout:
-            if all(pd.notna(getattr(ticker, "last", float("nan"))) for _, ticker in tickers):
-                break
-            self.ib.sleep(0.1)
-            elapsed += 0.1
-
-        for symbol, ticker in tickers:
-            values = [
-                getattr(ticker, "marketPrice", lambda: float("nan"))(),
-                getattr(ticker, "last", float("nan")),
-                getattr(ticker, "ask", float("nan")),
-                getattr(ticker, "bid", float("nan")),
-                getattr(ticker, "close", float("nan")),
-            ]
-            for value in values:
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if pd.notna(value) and value > 0:
-                    prices[symbol] = value
-                    break
-            try:
-                self.ib.cancelMktData(ticker)
-            except Exception:
-                pass
-        return pd.Series(prices, dtype=float)
 
     def place_order(self, order: Order) -> str:
         from ib_insync import LimitOrder
